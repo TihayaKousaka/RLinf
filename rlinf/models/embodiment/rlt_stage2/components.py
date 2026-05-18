@@ -1,0 +1,213 @@
+"""Core Stage 2 components for RLT.
+
+This module keeps the original Stage 2 structure lightweight:
+- a frozen VLA backbone provides reference actions and embeddings
+- a frozen RL token encoder compresses embeddings into z_rl
+- a residual actor predicts corrections over VLA reference chunks
+- a twin-Q critic scores chunk actions for TD3-style updates
+"""
+
+from __future__ import annotations
+
+import copy
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+class MLP(nn.Module):
+    """Simple MLP used by the residual actor and Q networks."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        last_dim = input_dim
+        for _ in range(num_hidden_layers):
+            layers.extend([nn.Linear(last_dim, hidden_dim), nn.ReLU()])
+            last_dim = hidden_dim
+        layers.append(nn.Linear(last_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class ResidualActor(nn.Module):
+    """Residual actor over VLA reference chunks.
+
+    The actor conditions on:
+    - RL state x = [z_rl, s^p]
+    - VLA reference action chunk a_tilde
+
+    The final action is a_tilde + residual, optionally with exploration noise.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_chunk_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+        sigma: float = 0.1,
+        ref_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.action_chunk_dim = action_chunk_dim
+        self.sigma = sigma
+        self.ref_dropout = ref_dropout
+
+        self.mlp = MLP(
+            input_dim=state_dim + action_chunk_dim,
+            output_dim=action_chunk_dim,
+            hidden_dim=hidden_dim,
+            num_hidden_layers=num_hidden_layers,
+        )
+
+        # Start from the frozen VLA reference exactly.
+        last_linear = [m for m in self.mlp.net if isinstance(m, nn.Linear)][-1]
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def _apply_ref_dropout(self, a_tilde: Tensor) -> Tensor:
+        if not self.training or self.ref_dropout <= 0.0:
+            return a_tilde
+
+        keep_mask = (
+            torch.rand(a_tilde.shape[0], 1, device=a_tilde.device) >= self.ref_dropout
+        )
+        return a_tilde * keep_mask
+
+    def forward(
+        self,
+        x: Tensor,
+        a_tilde: Tensor,
+        deterministic: bool = False,
+    ) -> Tensor:
+        a_tilde_input = self._apply_ref_dropout(a_tilde)
+        residual = self.mlp(torch.cat([x, a_tilde_input], dim=-1))
+        action = a_tilde + residual
+
+        if self.training and not deterministic and self.sigma > 0.0:
+            action = action + torch.randn_like(action) * self.sigma
+        return action.clamp(-1.0, 1.0)
+
+
+class QNetwork(nn.Module):
+    """Single Q network: (x, a) -> scalar."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_chunk_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.mlp = MLP(
+            input_dim=state_dim + action_chunk_dim,
+            output_dim=1,
+            hidden_dim=hidden_dim,
+            num_hidden_layers=num_hidden_layers,
+        )
+
+    def forward(self, x: Tensor, a: Tensor) -> Tensor:
+        return self.mlp(torch.cat([x, a], dim=-1))
+
+
+class TwinQCritic(nn.Module):
+    """Twin Q critic with target copies."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_chunk_dim: int,
+        hidden_dim: int = 256,
+        num_hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.q1 = QNetwork(state_dim, action_chunk_dim, hidden_dim, num_hidden_layers)
+        self.q2 = QNetwork(state_dim, action_chunk_dim, hidden_dim, num_hidden_layers)
+        self.q1_target = copy.deepcopy(self.q1)
+        self.q2_target = copy.deepcopy(self.q2)
+        for param in self.q1_target.parameters():
+            param.requires_grad_(False)
+        for param in self.q2_target.parameters():
+            param.requires_grad_(False)
+
+    def forward(self, x: Tensor, a: Tensor) -> tuple[Tensor, Tensor]:
+        return self.q1(x, a), self.q2(x, a)
+
+    def q_min(self, x: Tensor, a: Tensor) -> Tensor:
+        q1, q2 = self.forward(x, a)
+        return torch.min(q1, q2)
+
+    @torch.no_grad()
+    def target_q_min(self, x: Tensor, a: Tensor) -> Tensor:
+        q1 = self.q1_target(x, a)
+        q2 = self.q2_target(x, a)
+        return torch.min(q1, q2)
+
+    @torch.no_grad()
+    def update_targets(self, tau: float) -> None:
+        for online, target in (
+            (self.q1, self.q1_target),
+            (self.q2, self.q2_target),
+        ):
+            for src_param, dst_param in zip(
+                online.parameters(),
+                target.parameters(),
+                strict=True,
+            ):
+                dst_param.data.lerp_(src_param.data, tau)
+
+
+@torch.no_grad()
+def compute_td_target(
+    *,
+    rewards: Tensor,
+    dones: Tensor,
+    next_x: Tensor,
+    next_a_tilde: Tensor,
+    actor: ResidualActor,
+    critic: TwinQCritic,
+    gamma: float,
+    chunk_length: int,
+    target_noise_sigma: float = 0.2,
+    target_noise_clip: float = 0.5,
+) -> Tensor:
+    """Compute TD3-style chunk target."""
+    discount_powers = gamma ** torch.arange(
+        chunk_length, device=rewards.device, dtype=rewards.dtype
+    )
+    chunk_return = (rewards * discount_powers).sum(dim=-1, keepdim=True)
+
+    was_training = actor.training
+    actor.eval()
+    next_a = actor(next_x, next_a_tilde, deterministic=True)
+    if was_training:
+        actor.train()
+
+    noise = torch.randn_like(next_a) * target_noise_sigma
+    noise = noise.clamp(-target_noise_clip, target_noise_clip)
+    next_a = (next_a + noise).clamp(-1.0, 1.0)
+
+    next_q = critic.target_q_min(next_x, next_a)
+    bootstrap = (gamma**chunk_length) * (1.0 - dones) * next_q
+    return chunk_return + bootstrap
+
+
+def critic_loss(q1: Tensor, q2: Tensor, q_target: Tensor) -> Tensor:
+    return F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+
+
+def actor_loss(q_value: Tensor, a: Tensor, a_tilde: Tensor, beta: float) -> Tensor:
+    policy_loss = -q_value.mean()
+    bc_loss = F.mse_loss(a, a_tilde)
+    return policy_loss + beta * bc_loss

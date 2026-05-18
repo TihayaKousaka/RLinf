@@ -1,0 +1,39 @@
+env_type: maniskill
+
+total_num_envs: null
+
+wrap_obs_mode: rlt_openpi
+use_full_state: False
+auto_reset: False
+ignore_terminations: False
+use_rel_reward: False
+reward_mode: rlt_events
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 50
+max_episode_steps: 500
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+init_params:
+  id: "PegInsertionSide-v1"
+  num_envs: null
+  obs_mode: "rgb"
+  control_mode: "pd_ee_delta_pose"
+  sim_backend: "gpu"
+  reward_mode: "sparse"
+  sim_config:
+    sim_freq: 100
+    control_freq: 10
+  max_episode_steps: ${env.train.max_episode_steps}
+  sensor_configs:
+    shader_pack: "default"
+    width: 256
+    height: 256
+  render_mode: all
