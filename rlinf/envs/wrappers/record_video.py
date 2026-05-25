@@ -435,9 +435,17 @@ class RecordVideo(gym.Wrapper):
         self.record_video_in_result(result)
         return result
 
-    def flush_video(self, video_sub_dir: Optional[str] = None):
-        """Write buffered frames to an MP4 file (async)."""
+    def flush_video(self, video_sub_dir: Optional[str] = None, wait: bool = False):
+        """Write buffered frames to an MP4 file.
+
+        By default the write is queued asynchronously. When ``wait=True``, this
+        call also blocks until all pending background writes complete. This is
+        important for short-lived eval jobs where the worker may exit
+        immediately after ``flush_video()``, otherwise leaving truncated MP4s.
+        """
         if not self.render_images:
+            if wait:
+                self.wait_for_pending_saves()
             return
 
         output_dir = os.path.join(
@@ -452,6 +460,8 @@ class RecordVideo(gym.Wrapper):
         self.render_images = []
         self.video_cnt += 1
         self._submit_save(frames, mp4_path)
+        if wait:
+            self.wait_for_pending_saves()
 
     def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
         """Submit a background job to save the video."""
@@ -475,6 +485,13 @@ class RecordVideo(gym.Wrapper):
     def _prune_futures(self) -> None:
         """Remove finished futures to avoid unbounded growth."""
         self._save_futures = [f for f in self._save_futures if not f.done()]
+
+    def wait_for_pending_saves(self) -> None:
+        """Block until all queued video writes complete."""
+        pending = list(self._save_futures)
+        self._save_futures = []
+        for future in pending:
+            future.result()
 
     def close(self):
         """Wait for pending video writes before closing."""

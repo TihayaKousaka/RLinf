@@ -13,7 +13,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-0
+    actor,env,rollout: 0-3
 
 runner:
   task_type: sft
@@ -21,12 +21,12 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "rlt_maniskill_pi05_sft"
-    logger_backends: ["tensorboard"]
+    logger_backends: ["wandb"]
 
   max_epochs: -1
-  max_steps: 5000
+  max_steps: 20000
   val_check_interval: -1
-  save_interval: 1000
+  save_interval: 500
 
 data:
   train_data_paths:
@@ -40,12 +40,12 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 64
+  global_batch_size: 256
   seed: 0
   openpi_data:
     repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_240"
     norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/pi05_base/rlt_maniskill/norm_stats.json"
-    default_prompt: "insert the peg in the hole"
+    default_prompt: "insert the peg into the hole"
 
   model:
     precision: null

@@ -707,7 +707,7 @@ class EnvWorker(Worker):
                 if self.cfg.env.eval.video_cfg.save_video and isinstance(
                     self.eval_env_list[i], RecordVideo
                 ):
-                    self.eval_env_list[i].flush_video()
+                    self.eval_env_list[i].flush_video(wait=True)
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 

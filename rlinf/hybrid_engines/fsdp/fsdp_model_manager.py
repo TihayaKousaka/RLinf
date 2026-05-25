@@ -392,9 +392,13 @@ class FSDPModelManager:
         """
         self.optimizer_steps += 1
         self.grad_scaler.unscale_(self.optimizer)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if not torch.isfinite(torch.as_tensor(grad_norm)):
             self._logger.warning(
@@ -402,8 +406,12 @@ class FSDPModelManager:
             )
         else:
             self.grad_scaler.step(optimizer=self.optimizer)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         self.grad_scaler.update()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if self.critic_warmup_steps > 0:
             lr_list = [0.0 for _ in self.optimizer.param_groups]

@@ -360,12 +360,6 @@ class FSDPStrategy(FSDPStrategyBase):
             raise RuntimeError("Expected FSDP root module with `_all_handles`.")
 
         all_no_shard = all(not handle.uses_sharded_strategy for handle in all_handles)
-        if all_no_shard:
-            return (
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, norm_type)
-                .cpu()
-                .item()
-            )
         sharded_params_set, nonsharded_params_set = set(), set()
         sharded_params, nonsharded_params = [], []
         grads = []
@@ -401,6 +395,25 @@ class FSDPStrategy(FSDPStrategyBase):
                 nonsharded_params.append(p)
                 if p.grad is not None:
                     grads.append(p.grad)
+
+        if all_no_shard:
+            if not grads:
+                return 0.0
+            total_norm = get_grad_norm_for_mixed_precision(
+                nonsharded_params,
+                norm_type,
+                torch.tensor(0.0, device=device, dtype=torch.float32),
+                device,
+            )
+            grad_norm = float(total_norm.item())
+            if grad_norm == 0.0 or grad_norm <= max_norm:
+                return grad_norm
+            clip_coef = max_norm / total_norm
+            clip_coef = torch.clamp(clip_coef, max=1.0)
+            for g in grads:
+                g.mul_(clip_coef.to(device=g.device, dtype=g.dtype))
+            return grad_norm
+
         local_sharded_norm = get_grad_norm_for_mixed_precision(
             sharded_params,
             norm_type,

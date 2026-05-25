@@ -171,14 +171,27 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                         losses, device=self.device, dtype=torch.float32
                     )
                 loss = losses.mean()
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite SFT loss detected on rank {self._rank}: {loss.detach().cpu().item()}"
+                    )
+
+                # Surface CUDA failures at the actual forward stage instead of
+                # much later during grad clipping / metric all-reduce.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
 
                 loss = loss / self.gradient_accumulation
                 avg_loss += loss.item()
                 with backward_ctx:
                     self.grad_scaler.scale(loss).backward()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.device)
 
             # in one step do the optimizer step
             grad_norm, lr_list = self.optimizer_step()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
             self.optimizer.zero_grad(set_to_none=True)
 
             lr_value = (
