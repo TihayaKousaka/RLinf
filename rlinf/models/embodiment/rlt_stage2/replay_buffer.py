@@ -58,6 +58,7 @@ class RLTStage2ReplayBuffer:
         self._next_x = np.zeros((capacity, state_dim), dtype=np.float32)
         self._next_a_tilde = np.zeros((capacity, action_chunk_dim), dtype=np.float32)
         self._dones = np.zeros((capacity, 1), dtype=np.float32)
+        self._intervention = np.zeros((capacity, 1), dtype=np.float32)
 
     def __len__(self) -> int:
         return self._size
@@ -75,6 +76,7 @@ class RLTStage2ReplayBuffer:
         next_x: np.ndarray,
         next_a_tilde: np.ndarray,
         done: float,
+        intervention: float = 0.0,
     ) -> None:
         self._x[self._ptr] = x
         self._a[self._ptr] = a
@@ -83,6 +85,7 @@ class RLTStage2ReplayBuffer:
         self._next_x[self._ptr] = next_x
         self._next_a_tilde[self._ptr] = next_a_tilde
         self._dones[self._ptr] = done
+        self._intervention[self._ptr] = intervention
 
         self._ptr = (self._ptr + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
@@ -115,6 +118,7 @@ class RLTStage2ReplayBuffer:
             "next_x": self._next_x[:n].copy(),
             "next_a_tilde": self._next_a_tilde[:n].copy(),
             "dones": self._dones[:n].copy(),
+            "intervention": self._intervention[:n].copy(),
             "rng_state": self._rng.bit_generator.state,
         }
 
@@ -129,13 +133,20 @@ class RLTStage2ReplayBuffer:
         self._next_x[:n] = state["next_x"]
         self._next_a_tilde[:n] = state["next_a_tilde"]
         self._dones[:n] = state["dones"]
+        if "intervention" in state:
+            self._intervention[:n] = state["intervention"]
         rng_state = state.get("rng_state")
         if rng_state is not None:
             self._rng.bit_generator.state = rng_state
 
     def get_stats(self) -> dict[str, float]:
+        n = self._size
+        intervention_rate = (
+            float(self._intervention[:n].mean()) if n > 0 else 0.0
+        )
         return {
             "size": float(self._size),
             "capacity": float(self.capacity),
             "fill_ratio": float(self._size / max(self.capacity, 1)),
+            "intervention_rate": intervention_rate,
         }

@@ -285,11 +285,19 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         rewards_all = traj.rewards
         if dones_all is None or rewards_all is None:
             return 0
+        intervention_flags_all = traj.forward_inputs.get("intervention_flags")
+        if intervention_flags_all is None:
+            intervention_flags_all = traj.intervene_flags
 
         for env_idx in range(bsz):
             for t in range(traj_len):
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 done = float(dones_all[done_idx, env_idx].any().item())
+                intervention = 0.0
+                if intervention_flags_all is not None:
+                    intervention = float(
+                        intervention_flags_all[t, env_idx].detach().float().mean().item()
+                    )
 
                 x = x_all[t, env_idx].detach().cpu().numpy().astype(np.float32, copy=False)
                 a_tilde = (
@@ -352,6 +360,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     next_x=next_x,
                     next_a_tilde=next_a_tilde,
                     done=done,
+                    intervention=intervention,
                 )
                 added += 1
                 if done > 0.0:
@@ -462,6 +471,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
         }
 
+        min_buffer_size = int(
+            self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1)
+        )
         actor_warmup_steps = int(
             self.cfg.algorithm.get("actor_warmup_steps", min_buffer_size)
         )
@@ -498,15 +510,20 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                             ),
                             apply_action_noise=False,
                         )
-                        residual = actions - batch["a_tilde"].to(torch.float32)
+                        a_tilde_flat = batch["a_tilde"].to(torch.float32)
+                        residual = actions - a_tilde_flat
+                        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+                        action_dim = int(self.cfg.actor.model.action_dim)
+                        actions_chunk = actions.reshape(-1, chunk_len, action_dim)
+                        a_tilde_chunk = a_tilde_flat.reshape(-1, chunk_len, action_dim)
                         q_value = self.model.critic_min(
                             batch["x"].to(torch.float32),
                             actions,
                         )
                         actor_total_loss, actor_loss_metrics = actor_loss(
                             q_value=q_value,
-                            a=actions,
-                            a_tilde=batch["a_tilde"].to(torch.float32),
+                            a=actions_chunk,
+                            a_tilde=a_tilde_chunk,
                             bc_weight=bc_weight,
                             q_weight=q_weight,
                             delta_weight=delta_weight,

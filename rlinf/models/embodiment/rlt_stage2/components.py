@@ -216,6 +216,12 @@ def critic_loss(q1: Tensor, q2: Tensor, q_target: Tensor) -> Tensor:
 
 
 def chunk_delta_loss(a: Tensor, a_tilde: Tensor) -> Tensor:
+    if a.ndim != 3 or a_tilde.ndim != 3:
+        raise ValueError(
+            "chunk_delta_loss expects action tensors with shape [B, T, A], got "
+            f"{tuple(a.shape)} and {tuple(a_tilde.shape)}."
+        )
+
     if a.shape[1] <= 1:
         return torch.zeros((), device=a.device, dtype=a.dtype)
     pred_delta = a[:, 1:, :] - a[:, :-1, :]

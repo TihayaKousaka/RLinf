@@ -98,12 +98,32 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        self.intervention_enabled = False
+        self.intervention_success_baseline = None
+        self.intervention_last_success = None
 
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
         assert weight_syncer_cfg is not None, (
             "rollout.weight_syncer config must be provided"
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
+
+    def _is_rlt_stage2_td3(self) -> bool:
+        return (
+            self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
+            and SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.RLT_STAGE2
+        )
+
+    def set_intervention_state(
+        self,
+        *,
+        enabled: bool,
+        success_baseline: float | None = None,
+        last_success: float | None = None,
+    ) -> None:
+        self.intervention_enabled = bool(enabled)
+        self.intervention_success_baseline = success_baseline
+        self.intervention_last_success = last_success
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -124,6 +144,12 @@ class MultiStepRolloutWorker(Worker):
                 expert_model_config.model_path = (
                     self.cfg.rollout.expert_model.model_path
                 )
+                if expert_model_config.get("rlt_stage2", None) is not None:
+                    expert_model_config.rlt_stage2.act_as_vla_reference = (
+                        self.cfg.rollout.expert_model.get(
+                            "act_as_vla_reference", self._is_rlt_stage2_td3()
+                        )
+                    )
             self.expert_model = get_model(expert_model_config)
 
             if self.cfg.runner.get("expert_ckpt_path", None):
@@ -202,8 +228,13 @@ class MultiStepRolloutWorker(Worker):
         }
 
         if self.expert_model is not None:
+            intervention_cfg = self.cfg.algorithm.get("intervention", {})
+            default_beta = intervention_cfg.get(
+                "probability",
+                self.cfg.algorithm.get("dagger", {}).get("init_beta", 0.5),
+            )
             self._dagger_sampling_params = {
-                "beta": self.cfg.algorithm.get("dagger", {}).get("init_beta", 0.5),
+                "beta": default_beta,
                 "beta_schedule": self.cfg.algorithm.get("dagger", {}).get(
                     "beta_schedule", "exponential"
                 ),
@@ -215,6 +246,8 @@ class MultiStepRolloutWorker(Worker):
 
     def update_dagger_beta(self):
         if self.expert_model is None:
+            return
+        if self._is_rlt_stage2_td3():
             return
 
         if self._dagger_sampling_params["beta_schedule"] == "exponential":
@@ -279,6 +312,7 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
+            SupportedModel.RLT_STAGE2,
         ]:
             if self.cfg.algorithm.loss_type == "embodied_dagger":
                 kwargs = {"mode": "eval"}
@@ -295,9 +329,13 @@ class MultiStepRolloutWorker(Worker):
         only_save_expert = self.cfg.algorithm.get("dagger", {}).get(
             "only_save_expert", True
         )
+        is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
 
-        if mode == "train" and self.expert_model is not None:
-            # training with expert model. Beta-probability acting.
+        if (
+            mode == "train"
+            and self.expert_model is not None
+            and (not is_rlt_stage2_td3 or self.intervention_enabled)
+        ):
             use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
         else:
             use_expert = False
@@ -305,7 +343,29 @@ class MultiStepRolloutWorker(Worker):
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            if use_expert:
+            if use_expert and is_rlt_stage2_td3:
+                _, result = self.hf_model.predict_action_batch(
+                    env_obs=env_obs,
+                    **kwargs,
+                )
+                actions, _ = self.expert_model.predict_action_batch(
+                    env_obs=env_obs,
+                    **kwargs,
+                )
+                action_flat = actions.reshape(actions.shape[0], -1)
+                forward_inputs = result["forward_inputs"]
+                if "a_tilde" in forward_inputs:
+                    forward_inputs["base_a_tilde"] = forward_inputs["a_tilde"].detach()
+                    forward_inputs["a_tilde"] = action_flat.detach()
+                forward_inputs["action"] = action_flat.detach()
+                forward_inputs["intervention_flags"] = torch.full(
+                    (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                    True,
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+                expert_label_flag = True
+            elif use_expert:
                 actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
@@ -319,7 +379,8 @@ class MultiStepRolloutWorker(Worker):
 
             # Decide re-label or not
             if (
-                not only_save_expert  # only re-label in classic dagger mode
+                not is_rlt_stage2_td3
+                and not only_save_expert  # only re-label in classic dagger mode
                 and not use_expert  # only re-label if not using expert
                 and self.expert_model is not None  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
@@ -335,6 +396,38 @@ class MultiStepRolloutWorker(Worker):
                 if expert_target is not None:
                     result["forward_inputs"]["model_action"] = expert_target
                 expert_label_flag = True
+
+            if is_rlt_stage2_td3 and "forward_inputs" in result:
+                forward_inputs = result["forward_inputs"]
+                if "a_tilde" in forward_inputs and "base_a_tilde" not in forward_inputs:
+                    forward_inputs["base_a_tilde"] = forward_inputs["a_tilde"].detach()
+                if "intervention_flags" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["intervention_flags"] = torch.zeros(
+                        (batch_size, self.cfg.actor.model.num_action_chunks),
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                forward_inputs["intervention_enabled"] = torch.full(
+                    (actions.shape[0], 1),
+                    self.intervention_enabled,
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+                if self.intervention_success_baseline is not None:
+                    forward_inputs["intervention_success_baseline"] = torch.full(
+                        (actions.shape[0], 1),
+                        float(self.intervention_success_baseline),
+                        dtype=torch.float32,
+                        device=actions.device,
+                    )
+                if self.intervention_last_success is not None:
+                    forward_inputs["intervention_last_success"] = torch.full(
+                        (actions.shape[0], 1),
+                        float(self.intervention_last_success),
+                        dtype=torch.float32,
+                        device=actions.device,
+                    )
 
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
@@ -407,8 +500,10 @@ class MultiStepRolloutWorker(Worker):
                 env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
 
-                save_flags = None
-                if result.get("expert_label_flag", False):
+                save_flags = result.get("forward_inputs", {}).get(
+                    "intervention_flags", None
+                )
+                if save_flags is None and result.get("expert_label_flag", False):
                     save_flags = torch.full(
                         (actions.shape[0], self.cfg.actor.model.num_action_chunks),
                         True,

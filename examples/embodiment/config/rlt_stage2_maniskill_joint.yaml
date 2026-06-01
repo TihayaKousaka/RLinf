@@ -51,6 +51,11 @@ algorithm:
   actor_warmup_steps: 600
   actor_warmup_updates: 2000
   target_update_freq: 1
+  intervention:
+    enable: True
+    success_metric: "env/success_once"
+    relative_drop: 0.10
+    probability: 0.5
   replay_buffer:
     enable_cache: True
     cache_size: 10000
@@ -129,6 +134,10 @@ rollout:
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
+  expert_model:
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor"
+    precision: null
+    act_as_vla_reference: True
   enable_torch_compile: False
   enable_cuda_graph: False
 

@@ -100,12 +100,47 @@ class EmbodiedRunner:
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
+        self.intervention_success_baseline = None
 
         # Async logging setup
         self.stop_logging = False
         self.log_queue = queue.Queue()
         self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
         self.log_thread.start()
+
+    def _update_rollout_intervention_state(self, env_metrics: dict) -> dict[str, float]:
+        intervention_cfg = self.cfg.algorithm.get("intervention", {})
+        if not intervention_cfg.get("enable", False):
+            return {}
+
+        success_key = intervention_cfg.get("success_metric", "env/success_once")
+        if success_key not in env_metrics:
+            return {}
+
+        current_success = float(env_metrics[success_key])
+        if self.intervention_success_baseline is None:
+            self.intervention_success_baseline = current_success
+            enabled = False
+        else:
+            relative_drop = float(intervention_cfg.get("relative_drop", 0.10))
+            threshold = self.intervention_success_baseline * (1.0 - relative_drop)
+            enabled = current_success < threshold
+
+        self.rollout.set_intervention_state(
+            enabled=enabled,
+            success_baseline=float(self.intervention_success_baseline),
+            last_success=current_success,
+        ).wait()
+
+        return {
+            "intervention/success_baseline": float(self.intervention_success_baseline),
+            "intervention/last_success": current_success,
+            "intervention/enabled_next_rollout": float(enabled),
+            "intervention/relative_drop_threshold": float(
+                self.intervention_success_baseline
+                * (1.0 - float(intervention_cfg.get("relative_drop", 0.10)))
+            ),
+        }
 
     def _log_worker(self):
         """Background thread for processing log messages."""
@@ -377,6 +412,7 @@ class EmbodiedRunner:
             ]
             env_metrics = compute_evaluate_metrics(env_results_list)
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+            intervention_metrics = self._update_rollout_intervention_state(env_metrics)
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}
                 for rank, rank_metrics in enumerate(env_results)
@@ -400,6 +436,8 @@ class EmbodiedRunner:
             }
 
             self.metric_logger.log(env_metrics, _step)
+            if intervention_metrics:
+                self.metric_logger.log(intervention_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
             self.metric_logger.log(training_metrics, _step)

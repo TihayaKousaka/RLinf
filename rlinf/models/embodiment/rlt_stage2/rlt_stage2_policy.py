@@ -40,6 +40,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.action_dim = int(cfg.action_dim)
         self.action_chunk_dim = self.chunk_length * self.action_dim
         self.proprio_dim = int(stage2_cfg.get("proprio_dim", self.action_dim))
+        self.act_as_vla_reference = bool(stage2_cfg.get("act_as_vla_reference", False))
 
         self.vla = Stage2VLAWrapper(
             model_path=cfg.model_path,
@@ -275,13 +276,16 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         x, a_tilde, processed_obs = self._prepare_features(env_obs)
         deterministic = mode == "eval"
-        if deterministic:
+        if deterministic or self.act_as_vla_reference:
             self.actor.eval()
-        action_flat = self.actor_forward(
-            x,
-            a_tilde,
-            deterministic=deterministic,
-        )
+        if self.act_as_vla_reference:
+            action_flat = a_tilde
+        else:
+            action_flat = self.actor_forward(
+                x,
+                a_tilde,
+                deterministic=deterministic,
+            )
         actions = action_flat.reshape(
             action_flat.shape[0],
             self.chunk_length,
