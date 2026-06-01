@@ -89,12 +89,20 @@ class ResidualActor(nn.Module):
         x: Tensor,
         a_tilde: Tensor,
         deterministic: bool = False,
+        *,
+        apply_ref_dropout: bool | None = None,
+        apply_action_noise: bool | None = None,
     ) -> Tensor:
-        a_tilde_input = self._apply_ref_dropout(a_tilde)
+        if apply_ref_dropout is None:
+            apply_ref_dropout = not deterministic
+        if apply_action_noise is None:
+            apply_action_noise = not deterministic
+
+        a_tilde_input = self._apply_ref_dropout(a_tilde) if apply_ref_dropout else a_tilde
         residual = self.mlp(torch.cat([x, a_tilde_input], dim=-1))
         action = a_tilde + residual
 
-        if self.training and not deterministic and self.sigma > 0.0:
+        if self.training and apply_action_noise and self.sigma > 0.0:
             action = action + torch.randn_like(action) * self.sigma
         return action.clamp(-1.0, 1.0)
 
@@ -207,7 +215,34 @@ def critic_loss(q1: Tensor, q2: Tensor, q_target: Tensor) -> Tensor:
     return F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
 
 
-def actor_loss(q_value: Tensor, a: Tensor, a_tilde: Tensor, beta: float) -> Tensor:
-    policy_loss = -q_value.mean()
+def chunk_delta_loss(a: Tensor, a_tilde: Tensor) -> Tensor:
+    if a.shape[1] <= 1:
+        return torch.zeros((), device=a.device, dtype=a.dtype)
+    pred_delta = a[:, 1:, :] - a[:, :-1, :]
+    ref_delta = a_tilde[:, 1:, :] - a_tilde[:, :-1, :]
+    return F.mse_loss(pred_delta, ref_delta)
+
+
+def actor_loss(
+    q_value: Tensor,
+    a: Tensor,
+    a_tilde: Tensor,
+    *,
+    bc_weight: float,
+    q_weight: float,
+    delta_weight: float,
+) -> tuple[Tensor, dict[str, Tensor]]:
     bc_loss = F.mse_loss(a, a_tilde)
-    return policy_loss + beta * bc_loss
+    delta_loss = chunk_delta_loss(a, a_tilde)
+    q_mean = q_value.mean()
+    total_loss = (
+        bc_weight * bc_loss
+        - q_weight * q_mean
+        + delta_weight * delta_loss
+    )
+    metrics = {
+        "bc_loss": bc_loss.detach(),
+        "delta_loss": delta_loss.detach(),
+        "q_mean": q_mean.detach(),
+    }
+    return total_loss, metrics

@@ -15,7 +15,9 @@
 
 import dataclasses
 import difflib
+import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import openpi.models.pi0_config as pi0_config
@@ -60,12 +62,17 @@ from rlinf.models.embodiment.openpi.dataconfig.realworld_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.rlt_maniskill_dataconfig import (
     LeRobotRLTManiSkillDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.rlt_maniskill_joint_dataconfig import (
+    LeRobotRLTManiSkillJointDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
     LeRobotRobocasaDataConfig,
 )
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _CONFIGS = [
@@ -128,7 +135,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_maniskill",
         model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False
+            pi05=True, action_horizon=10, discrete_state_input=True
         ),  # discrete_state_input=False: stateless policy, True: with state policy
         data=LeRobotManiSkillDataConfig(
             repo_id="physical-intelligence/maniskill",
@@ -158,6 +165,32 @@ _CONFIGS = [
             repo_id="rlt_maniskill",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_rlt_maniskill/assets"),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        seed=0,
+        batch_size=256,
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_workers=8,
+        num_train_steps=5_000,
+        log_interval=5,
+        save_interval=250,
+    ),
+    TrainConfig(
+        name="pi05_rlt_maniskill_joint",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=True
+        ),
+        data=LeRobotRLTManiSkillJointDataConfig(
+            repo_id="rlt_maniskill_joint",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_rlt_maniskill_joint/assets"
+            ),
             extra_delta_transform=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
@@ -468,9 +501,55 @@ def _override_with_model_path(config: TrainConfig, model_path: str) -> TrainConf
 
 def _override_with_data_kwargs(config: TrainConfig, data_kwargs: dict) -> TrainConfig:
     """Return a copy of the config with data_config set from openpi_data."""
+    data_kwargs = dict(data_kwargs)
+    if "repo_id" in data_kwargs:
+        data_kwargs["repo_id"] = _normalize_local_lerobot_repo_id(data_kwargs["repo_id"])
     data_config = dataclasses.replace(config.data, **data_kwargs)
     replace_kwargs = {"data": data_config}
     return dataclasses.replace(config, **replace_kwargs)
+
+
+def _normalize_local_lerobot_repo_id(repo_id: Optional[str]) -> Optional[str]:
+    """Normalize an absolute local LeRobot dataset path to a repo name.
+
+    LeRobot 0.3.x loaders used by OpenPI expect:
+    - `repo_id=<folder_name>`
+    - `HF_LEROBOT_HOME=<parent_dir_of_folder>`
+
+    If we pass an absolute path directly, the underlying Hugging Face validators
+    treat it as a Hub repo id and may hit the network. Normalize here so SFT and
+    Stage1 can use local absolute paths without touching the Hub.
+    """
+    if repo_id is None:
+        return None
+
+    repo_id_str = os.path.expanduser(str(repo_id))
+    if not os.path.isabs(repo_id_str):
+        return repo_id_str
+
+    repo_path = Path(repo_id_str).resolve(strict=False)
+    lerobot_home = str(repo_path.parent)
+    normalized_repo_id = repo_path.name
+    current_home = os.environ.get("HF_LEROBOT_HOME")
+
+    if current_home != lerobot_home:
+        if current_home and current_home != lerobot_home:
+            logger.warning(
+                "Overriding HF_LEROBOT_HOME from %s to %s so local LeRobot dataset path %s "
+                "loads from disk instead of being treated as a Hub repo.",
+                current_home,
+                lerobot_home,
+                repo_id_str,
+            )
+        os.environ["HF_LEROBOT_HOME"] = lerobot_home
+
+    logger.info(
+        "Normalized local LeRobot dataset path %s -> repo_id=%s with HF_LEROBOT_HOME=%s",
+        repo_id_str,
+        normalized_repo_id,
+        lerobot_home,
+    )
+    return normalized_repo_id
 
 
 def get_openpi_config(
@@ -506,6 +585,7 @@ def get_openpi_config(
         config = dataclasses.replace(config, batch_size=batch_size)
 
     if repo_id is not None:
+        repo_id = _normalize_local_lerobot_repo_id(repo_id)
         original_repo_id = config.data.repo_id
         new_assets = dataclasses.replace(config.data.assets, asset_id=original_repo_id)
         new_data = dataclasses.replace(config.data, repo_id=repo_id, assets=new_assets)

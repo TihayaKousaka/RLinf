@@ -88,6 +88,27 @@ class EnvWorker(Worker):
             else eval_env_cfg.get("enable_offload", False)
         )
         self.enable_eval = self.cfg.runner.val_check_interval > 0 or self.only_eval
+        self.eval_action_exec_chunks = int(
+            self.cfg.env.eval.get(
+                "action_exec_chunks", self.cfg.actor.model.num_action_chunks
+            )
+        )
+        if self.eval_action_exec_chunks <= 0:
+            raise ValueError(
+                "env.eval.action_exec_chunks must be positive, got "
+                f"{self.eval_action_exec_chunks}"
+            )
+        if (
+            self.cfg.env.eval.max_steps_per_rollout_epoch
+            % self.eval_action_exec_chunks
+            != 0
+        ):
+            raise ValueError(
+                "env.eval.max_steps_per_rollout_epoch must be divisible by "
+                "env.eval.action_exec_chunks, got "
+                f"{self.cfg.env.eval.max_steps_per_rollout_epoch} and "
+                f"{self.eval_action_exec_chunks}"
+            )
         if not self.only_eval:
             if train_env_cfg is None:
                 raise ValueError(
@@ -108,7 +129,7 @@ class EnvWorker(Worker):
             )
         self.n_eval_chunk_steps = (
             self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
+            // self.eval_action_exec_chunks
         )
         self.actor_split_num = self.get_actor_split_num()
 
@@ -152,6 +173,16 @@ class EnvWorker(Worker):
                 env_cls=eval_env_cls,
                 env_cfg=self.cfg.env.eval,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
+            )
+            self.log_info(
+                "Eval action scheduling: "
+                f"model_num_action_chunks={self.cfg.actor.model.num_action_chunks}, "
+                f"action_exec_chunks={self.eval_action_exec_chunks}, "
+                f"n_eval_chunk_steps={self.n_eval_chunk_steps}, "
+                f"expected_env_steps="
+                f"{self.n_eval_chunk_steps * self.eval_action_exec_chunks}, "
+                f"max_steps_per_rollout_epoch="
+                f"{self.cfg.env.eval.max_steps_per_rollout_epoch}"
             )
 
         if not self.only_eval:
@@ -378,6 +409,32 @@ class EnvWorker(Worker):
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
 
+    @staticmethod
+    def _shape_str(value) -> str:
+        return "None" if value is None else str(tuple(getattr(value, "shape", ())))
+
+    def _validate_env_action_chunk(
+        self,
+        chunk_actions,
+        *,
+        mode: Literal["train", "eval"],
+        expected_chunks: int,
+    ) -> None:
+        expected_action_dim = int(self.cfg.actor.model.action_dim)
+        if (
+            not hasattr(chunk_actions, "shape")
+            or len(chunk_actions.shape) != 3
+            or int(chunk_actions.shape[1]) != int(expected_chunks)
+            or int(chunk_actions.shape[2]) != expected_action_dim
+        ):
+            raise ValueError(
+                f"Invalid {mode} env action chunk shape before chunk_step: "
+                f"expected [B, {expected_chunks}, {expected_action_dim}], got "
+                f"{self._shape_str(chunk_actions)}. Refuse to execute actions; "
+                "check actor.model.num_action_chunks/action_dim, "
+                "env.eval.action_exec_chunks, policy_setup, and action preparation."
+            )
+
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self, chunk_actions: torch.Tensor, stage_id: int
@@ -393,6 +450,11 @@ class EnvWorker(Worker):
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+        )
+        self._validate_env_action_chunk(
+            chunk_actions,
+            mode="train",
+            expected_chunks=int(self.cfg.actor.model.num_action_chunks),
         )
         env_info = {}
 
@@ -425,19 +487,27 @@ class EnvWorker(Worker):
                     for key in infos["episode"]:
                         env_info[key] = infos["episode"][key].cpu()
         elif chunk_dones.any():
-            if "final_info" in infos:
+            if isinstance(infos, dict) and "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                    env_info[key] = final_info["episode"][key][
+                        chunk_dones.any(dim=1)
+                    ].cpu()
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        if self.cfg.env.train.auto_reset and chunk_dones.any():
-            if "intervene_action" in infos["final_info"]:
-                intervene_actions = infos["final_info"]["intervene_action"]
-                intervene_flags = infos["final_info"]["intervene_flag"]
+        if (
+            self.cfg.env.train.auto_reset
+            and chunk_dones.any()
+            and isinstance(infos, dict)
+            and "final_info" in infos
+        ):
+            final_info = infos["final_info"]
+            if "intervene_action" in final_info:
+                intervene_actions = final_info["intervene_action"]
+                intervene_flags = final_info["intervene_flag"]
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -466,6 +536,17 @@ class EnvWorker(Worker):
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
         )
+        if chunk_actions.shape[1] < self.eval_action_exec_chunks:
+            raise ValueError(
+                f"Policy produced only {chunk_actions.shape[1]} action steps, "
+                f"but env.eval.action_exec_chunks={self.eval_action_exec_chunks}."
+            )
+        chunk_actions = chunk_actions[:, : self.eval_action_exec_chunks]
+        self._validate_env_action_chunk(
+            chunk_actions,
+            mode="eval",
+            expected_chunks=self.eval_action_exec_chunks,
+        )
         env_info = {}
 
         obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
@@ -486,17 +567,17 @@ class EnvWorker(Worker):
             )
         )
 
-        current_dones = chunk_dones[:, -1]  # [num_envs] bool
+        current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
         prev = self.eval_prev_done[stage_id].to(current_dones.device)
         newly_done = current_dones & ~prev
         self.eval_prev_done[stage_id] = prev | current_dones
 
         if newly_done.any():
-            if "final_info" in infos:
+            if isinstance(infos, dict) and "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][newly_done].cpu()
-            elif "episode" in infos:
+            elif isinstance(infos, dict) and "episode" in infos:
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 

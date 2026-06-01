@@ -52,6 +52,34 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
+    def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool]:
+        stage2_cfg = self.cfg.actor.model.rlt_stage2
+        warmup_updates = int(
+            self.cfg.algorithm.get(
+                "actor_warmup_updates",
+                self.cfg.algorithm.get("actor_warmup_steps", 0),
+            )
+        )
+        in_warmup = self.update_step < warmup_updates
+        if in_warmup:
+            bc_weight = float(
+                stage2_cfg.get(
+                    "warmup_bc_weight",
+                    stage2_cfg.get("bc_regularizer_beta", 1.0),
+                )
+            )
+            q_weight = float(stage2_cfg.get("warmup_q_weight", 0.1))
+        else:
+            bc_weight = float(
+                stage2_cfg.get(
+                    "online_bc_weight",
+                    stage2_cfg.get("bc_regularizer_beta", 1.0),
+                )
+            )
+            q_weight = float(stage2_cfg.get("online_q_weight", 0.1))
+        delta_weight = float(stage2_cfg.get("delta_weight", 0.0))
+        return bc_weight, q_weight, delta_weight, in_warmup
+
     def init_worker(self):
         self.setup_model_and_optimizer()
         self._init_replay_buffer()
@@ -392,7 +420,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         q1_values = []
         q2_values = []
 
-        self.qf_optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.qf_optimizer.zero_grad(set_to_none=True)
         for idx, batch in enumerate(micro_batches):
             backward_ctx = self.before_micro_batch(
                 self.model,
@@ -423,6 +452,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.grad_scaler.step(self.qf_optimizer)
         self.grad_scaler.update()
         self.qf_lr_scheduler.step()
+        self.qf_optimizer.zero_grad(set_to_none=True)
 
         metrics = {
             "rlt_stage2/critic_loss": float(np.mean(critic_losses)),
@@ -432,11 +462,26 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
         }
 
-        update_actor = self.update_step % int(self.cfg.algorithm.critic_actor_ratio) == 0
+        actor_warmup_steps = int(
+            self.cfg.algorithm.get("actor_warmup_steps", min_buffer_size)
+        )
+        actor_warmup_done = len(self.replay_buffer) >= actor_warmup_steps
+        bc_weight, q_weight, delta_weight, in_loss_warmup = (
+            self._resolve_actor_loss_weights()
+        )
+        update_actor = (
+            actor_warmup_done
+            and (self.update_step + 1) % int(self.cfg.algorithm.critic_actor_ratio) == 0
+        )
         if update_actor:
             actor_losses = []
             actor_q_values = []
+            actor_residual_abs = []
+            actor_residual_l2 = []
+            actor_bc_losses = []
+            actor_delta_losses = []
             self.optimizer.zero_grad()
+            self.model.set_online_critic_requires_grad(False)
             for idx, batch in enumerate(micro_batches):
                 backward_ctx = self.before_micro_batch(
                     self.model,
@@ -447,27 +492,47 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         actions = self.model.actor_forward(
                             batch["x"].to(torch.float32),
                             batch["a_tilde"].to(torch.float32),
-                            deterministic=False,
+                            deterministic=True,
+                            apply_ref_dropout=bool(
+                                stage2_cfg.get("ref_action_dropout", 0.0) > 0.0
+                            ),
+                            apply_action_noise=False,
                         )
+                        residual = actions - batch["a_tilde"].to(torch.float32)
                         q_value = self.model.critic_min(
                             batch["x"].to(torch.float32),
                             actions,
                         )
-                        loss = actor_loss(
+                        actor_total_loss, actor_loss_metrics = actor_loss(
                             q_value=q_value,
                             a=actions,
                             a_tilde=batch["a_tilde"].to(torch.float32),
-                            beta=float(stage2_cfg.bc_regularizer_beta),
-                        ) / self.gradient_accumulation
+                            bc_weight=bc_weight,
+                            q_weight=q_weight,
+                            delta_weight=delta_weight,
+                        )
+                        loss = actor_total_loss / self.gradient_accumulation
                     self.grad_scaler.scale(loss).backward()
                 actor_losses.append(loss.detach().float().item() * self.gradient_accumulation)
                 actor_q_values.append(q_value.detach().float().mean().item())
+                actor_residual_abs.append(residual.detach().float().abs().mean().item())
+                actor_residual_l2.append(
+                    residual.detach().float().pow(2).mean().sqrt().item()
+                )
+                actor_bc_losses.append(
+                    float(actor_loss_metrics["bc_loss"].float().item())
+                )
+                actor_delta_losses.append(
+                    float(actor_loss_metrics["delta_loss"].float().item())
+                )
+            self.model.set_online_critic_requires_grad(True)
 
             self.grad_scaler.unscale_(self.optimizer)
             actor_grad_norm = self._strategy.clip_grad_norm_(self.model)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
             self.lr_scheduler.step()
+            self.optimizer.zero_grad(set_to_none=True)
 
             metrics.update(
                 {
@@ -475,6 +540,26 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/q_mean": float(np.mean(actor_q_values)),
                     "actor/grad_norm": float(actor_grad_norm),
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
+                    "actor/residual_abs_mean": float(np.mean(actor_residual_abs)),
+                    "actor/residual_l2": float(np.mean(actor_residual_l2)),
+                    "actor/bc_weight": bc_weight,
+                    "actor/q_weight": q_weight,
+                    "actor/delta_weight": delta_weight,
+                    "actor/bc_loss": float(np.mean(actor_bc_losses)),
+                    "actor/delta_loss": float(np.mean(actor_delta_losses)),
+                    "actor/loss_warmup": float(in_loss_warmup),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "actor/update_skipped": 1.0,
+                    "actor/warmup_done": float(actor_warmup_done),
+                    "actor/warmup_steps": float(actor_warmup_steps),
+                    "actor/bc_weight": bc_weight,
+                    "actor/q_weight": q_weight,
+                    "actor/delta_weight": delta_weight,
+                    "actor/loss_warmup": float(in_loss_warmup),
                 }
             )
 

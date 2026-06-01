@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "rlt_maniskill_pi05_sft_eval"
+    experiment_name: "rlt_maniskill_joint_pi05_sft_eval"
     logger_backends: ["tensorboard"]
 
   only_eval: True
@@ -90,19 +90,22 @@ env:
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
-    wrap_obs_mode: rlt_openpi
+    wrap_obs_mode: rlt_openpi_joint
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     init_params:
       obs_mode: "rgb"
       reward_mode: "sparse"
+      sensor_configs:
+        width: 384
+        height: 384
 
   eval:
     total_num_envs: 8
     auto_reset: True
-    ignore_terminations: True
+    ignore_terminations: False
     use_fixed_reset_state_ids: True
-    wrap_obs_mode: rlt_openpi
+    wrap_obs_mode: rlt_openpi_joint
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     action_exec_chunks: 10
@@ -115,6 +118,9 @@ env:
     init_params:
       obs_mode: "rgb"
       reward_mode: "sparse"
+      sensor_configs:
+        width: 384
+        height: 384
 
 rollout:
   group_name: "RolloutGroup"
@@ -142,13 +148,13 @@ actor:
     precision: null
     model_type: "openpi"
     num_action_chunks: 10
-    action_dim: 7
+    action_dim: 8
     use_proprio: True
     add_value_head: False
     num_steps: 5
-    policy_setup: "rlt_maniskill"
+    policy_setup: "panda-qpos"
     openpi:
-      config_name: "pi05_rlt_maniskill"
+      config_name: "pi05_rlt_maniskill_joint"
       num_images_in_input: 2
       train_expert_only: False
       detach_critic_input: True
@@ -156,9 +162,9 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
     openpi_data:
-      repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_240"
-      norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/pi05_base/rlt_maniskill/norm_stats.json"
-      default_prompt: "insert the peg into the hole"
+      repo_id: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint"
+      norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/rlt_maniskill_joint/norm_stats.json"
+      default_prompt: "insert the peg in the hole"
 
   optim:
     lr: 2.5e-5

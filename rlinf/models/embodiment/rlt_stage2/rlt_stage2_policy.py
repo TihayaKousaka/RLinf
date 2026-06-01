@@ -46,6 +46,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             config_name=stage2_cfg.config_name,
             norm_stats_path=stage2_cfg.get("norm_stats_path", None),
             num_images_in_input=int(stage2_cfg.get("num_images_in_input", 1)),
+            num_action_chunks=self.chunk_length,
+            action_dim=self.action_dim,
+            num_steps=int(stage2_cfg.get("num_steps", cfg.get("num_steps", 5))),
             device=self.device,
         )
 
@@ -83,6 +86,39 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             num_hidden_layers=int(stage2_cfg.get("mlp_num_hidden_layers", 2)),
         ).to(self.device)
 
+    @staticmethod
+    def _shape_str(tensor: torch.Tensor | None) -> str:
+        return "None" if tensor is None else str(tuple(getattr(tensor, "shape", ())))
+
+    def _validate_action_chunk(self, tensor: torch.Tensor | None, *, name: str) -> None:
+        expected_tail = (self.chunk_length, self.action_dim)
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim != 3
+            or tuple(tensor.shape[1:]) != expected_tail
+        ):
+            raise ValueError(
+                f"RLT Stage2 {name} shape mismatch: expected [B, "
+                f"{self.chunk_length}, {self.action_dim}], got "
+                f"{self._shape_str(tensor)}. Check num_action_chunks, "
+                "action_dim, OpenPI action_horizon/action_env_dim, and dataset "
+                "action shape."
+            )
+
+    def _validate_flat_action(self, tensor: torch.Tensor | None, *, name: str) -> None:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim != 2
+            or tensor.shape[1] != self.action_chunk_dim
+        ):
+            raise ValueError(
+                f"RLT Stage2 {name} shape mismatch: expected [B, "
+                f"{self.action_chunk_dim}] from "
+                f"{self.chunk_length}x{self.action_dim}, got "
+                f"{self._shape_str(tensor)}. Refuse to continue with an "
+                "ambiguous action chunk layout."
+            )
+
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SAC:
             return self.sac_forward(**kwargs)
@@ -107,7 +143,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         embeddings, pad_mask = self.vla.extract_embeddings(observation)
         z_rl = self.rl_token_model.encode(embeddings, pad_mask)
         a_tilde = self.vla.get_rl_chunk_reference(observation, self.chunk_length)
+        self._validate_action_chunk(a_tilde, name="a_tilde")
         a_tilde_flat = a_tilde.reshape(a_tilde.shape[0], -1)
+        self._validate_flat_action(a_tilde_flat, name="a_tilde_flat")
         state = observation.state[:, : self.proprio_dim].to(
             device=self.device,
             dtype=torch.float32,
@@ -126,17 +164,30 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         a_tilde: torch.Tensor,
         *,
         deterministic: bool = False,
+        apply_ref_dropout: bool | None = None,
+        apply_action_noise: bool | None = None,
     ) -> torch.Tensor:
-        return self.actor(x, a_tilde, deterministic=deterministic)
+        self._validate_flat_action(a_tilde, name="actor input a_tilde")
+        action = self.actor(
+            x,
+            a_tilde,
+            deterministic=deterministic,
+            apply_ref_dropout=apply_ref_dropout,
+            apply_action_noise=apply_action_noise,
+        )
+        self._validate_flat_action(action, name="actor output action_flat")
+        return action
 
     def critic_forward(
         self,
         x: torch.Tensor,
         actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_flat_action(actions, name="critic input actions")
         return self.critic(x, actions)
 
     def critic_min(self, x: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        self._validate_flat_action(actions, name="critic_min input actions")
         return self.critic.q_min(x, actions)
 
     @torch.no_grad()
@@ -148,6 +199,10 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         next_x: torch.Tensor,
         next_a_tilde: torch.Tensor,
     ) -> torch.Tensor:
+        self._validate_flat_action(
+            next_a_tilde,
+            name="compute_td_target_batch next_a_tilde",
+        )
         stage2_cfg = self.cfg.rlt_stage2
         return compute_td_target(
             rewards=rewards,
@@ -166,6 +221,11 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     def update_target_networks(self, tau: float) -> None:
         self.critic.update_targets(tau)
 
+    def set_online_critic_requires_grad(self, requires_grad: bool) -> None:
+        for module in (self.critic.q1, self.critic.q2):
+            for param in module.parameters():
+                param.requires_grad_(requires_grad)
+
     @torch.no_grad()
     def encode_obs(
         self,
@@ -183,7 +243,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         if obs is None:
             obs = data if data is not None else kwargs.get("obs")
         x, a_tilde = self._encode_state_and_reference(obs)
-        action = self.actor(x, a_tilde, deterministic=deterministic)
+        action = self.actor_forward(x, a_tilde, deterministic=deterministic)
         logprob = torch.zeros(
             action.shape[0], 1, device=action.device, dtype=torch.float32
         )
@@ -203,7 +263,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             x, _ = self._encode_state_and_reference(obs)
         else:
             x = state_info["x"]
-        q1, q2 = self.critic(x, actions)
+        q1, q2 = self.critic_forward(x, actions)
         return torch.cat([q1, q2], dim=-1)
 
     @torch.no_grad()
@@ -217,8 +277,17 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         deterministic = mode == "eval"
         if deterministic:
             self.actor.eval()
-        action_flat = self.actor(x, a_tilde, deterministic=deterministic)
-        actions = action_flat.reshape(action_flat.shape[0], self.chunk_length, self.action_dim)
+        action_flat = self.actor_forward(
+            x,
+            a_tilde,
+            deterministic=deterministic,
+        )
+        actions = action_flat.reshape(
+            action_flat.shape[0],
+            self.chunk_length,
+            self.action_dim,
+        )
+        self._validate_action_chunk(actions, name="predict_action_batch actions")
         zeros = torch.zeros(
             action_flat.shape[0], 1, device=action_flat.device, dtype=torch.float32
         )

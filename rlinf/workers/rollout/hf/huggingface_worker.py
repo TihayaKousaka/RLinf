@@ -72,14 +72,28 @@ class MultiStepRolloutWorker(Worker):
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
+        self.eval_action_exec_chunks = int(
+            cfg.env.eval.get("action_exec_chunks", cfg.actor.model.num_action_chunks)
+        )
+        if self.eval_action_exec_chunks <= 0:
+            raise ValueError(
+                "env.eval.action_exec_chunks must be positive, got "
+                f"{self.eval_action_exec_chunks}"
+            )
+        if cfg.env.eval.max_steps_per_rollout_epoch % self.eval_action_exec_chunks != 0:
+            raise ValueError(
+                "env.eval.max_steps_per_rollout_epoch must be divisible by "
+                "env.eval.action_exec_chunks, got "
+                f"{cfg.env.eval.max_steps_per_rollout_epoch} and "
+                f"{self.eval_action_exec_chunks}"
+            )
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
         )
         self.n_eval_chunk_steps = (
-            cfg.env.eval.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            cfg.env.eval.max_steps_per_rollout_epoch // self.eval_action_exec_chunks
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0

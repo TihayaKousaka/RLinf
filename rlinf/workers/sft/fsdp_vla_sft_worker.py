@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -24,6 +26,77 @@ from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.pytree import register_pytree_dataclasses
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
+
+logger = logging.getLogger(__name__)
+
+
+def _create_local_lerobot_dataset(
+    repo_path: str,
+    *,
+    data_config: Any,
+    action_horizon: int,
+):
+    """Create a local LeRobot dataset without any Hugging Face Hub calls."""
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+    import openpi.training.data_loader as openpi_data_loader
+    import openpi.transforms as transforms
+
+    local_path = Path(repo_path).expanduser().resolve()
+    if not local_path.exists():
+        raise FileNotFoundError(f"Local LeRobot dataset path does not exist: {local_path}")
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+        local_path.name,
+        root=local_path,
+    )
+    dataset = lerobot_dataset.LeRobotDataset(
+        local_path.name,
+        root=local_path,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+
+    if data_config.prompt_from_task:
+        dataset = openpi_data_loader.TransformedDataset(
+            dataset,
+            [transforms.PromptFromLeRobotTask(dataset_meta.tasks)],
+        )
+
+    return dataset
+
+
+def _resolve_local_lerobot_repo_path(
+    data_kwargs: Any,
+    data_paths: list[Any],
+) -> str | None:
+    """Return the absolute local dataset path if the caller configured one."""
+    repo_id = None
+    if data_kwargs is not None:
+        repo_id = getattr(data_kwargs, "get", lambda *_: None)("repo_id")
+        if repo_id is None:
+            repo_id = getattr(data_kwargs, "repo_id", None)
+    if isinstance(repo_id, str) and os.path.isabs(repo_id):
+        return repo_id
+
+    if len(data_paths) == 1:
+        first_path = data_paths[0]
+        if isinstance(first_path, str) and os.path.isabs(first_path):
+            return first_path
+
+        dataset_path = None
+        if isinstance(first_path, dict):
+            dataset_path = first_path.get("dataset_path")
+        else:
+            dataset_path = getattr(first_path, "dataset_path", None)
+            if dataset_path is None and hasattr(first_path, "get"):
+                dataset_path = first_path.get("dataset_path")
+
+        if isinstance(dataset_path, str) and os.path.isabs(dataset_path):
+            return dataset_path
+
+    return None
 
 
 class FSDPVlaSftWorker(FSDPSftWorker):
@@ -54,9 +127,64 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 batch_size=batch_size,
                 data_kwargs=data_kwargs,
             )
-            data_loader = openpi_data_loader.create_data_loader(
-                config, framework="pytorch", shuffle=True
+            data_config = config.data.create(config.assets_dirs, config.model)
+            local_repo_path = _resolve_local_lerobot_repo_path(data_kwargs, data_paths)
+            logger.info(
+                "OpenPI SFT/Stage1 dataloader repo resolution: config_name=%s repo_id=%s local_repo_path=%s",
+                config_name,
+                getattr(data_config, "repo_id", None),
+                local_repo_path,
             )
+
+            if local_repo_path is not None:
+                logger.info(
+                    "Using local LeRobot dataset path for OpenPI SFT/Stage1 dataloader: %s",
+                    local_repo_path,
+                )
+                dataset = _create_local_lerobot_dataset(
+                    local_repo_path,
+                    data_config=data_config,
+                    action_horizon=config.model.action_horizon,
+                )
+                dataset = openpi_data_loader.transform_dataset(
+                    dataset,
+                    data_config,
+                    skip_norm_stats=False,
+                )
+
+                sampler = None
+                if torch.distributed.is_initialized():
+                    sampler = torch.utils.data.distributed.DistributedSampler(
+                        dataset,
+                        num_replicas=torch.distributed.get_world_size(),
+                        rank=torch.distributed.get_rank(),
+                        shuffle=True,
+                        drop_last=True,
+                    )
+                    local_batch_size = (
+                        batch_size // torch.distributed.get_world_size()
+                    )
+                else:
+                    local_batch_size = batch_size
+
+                torch_loader = openpi_data_loader.TorchDataLoader(
+                    dataset,
+                    local_batch_size=local_batch_size,
+                    sharding=None,
+                    shuffle=(sampler is None),
+                    sampler=sampler,
+                    num_batches=None,
+                    num_workers=config.num_workers,
+                    seed=config.seed,
+                    framework="pytorch",
+                )
+                data_loader = openpi_data_loader.DataLoaderImpl(
+                    data_config, torch_loader
+                )
+            else:
+                data_loader = openpi_data_loader.create_data_loader(
+                    config, framework="pytorch", shuffle=True
+                )
             return data_loader, data_loader.data_config()
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA

@@ -19,6 +19,9 @@ class Stage1VLAWrapper(Stage2VLAWrapper):
         config_name: str,
         norm_stats_path: str | None = None,
         num_images_in_input: int = 2,
+        num_action_chunks: int = 10,
+        action_dim: int = 8,
+        num_steps: int = 5,
         device: torch.device | str = "cuda",
     ) -> None:
         super().__init__(
@@ -26,6 +29,9 @@ class Stage1VLAWrapper(Stage2VLAWrapper):
             config_name=config_name,
             norm_stats_path=norm_stats_path,
             num_images_in_input=num_images_in_input,
+            num_action_chunks=num_action_chunks,
+            action_dim=action_dim,
+            num_steps=num_steps,
             device=device,
         )
         self.embedding_dim = 2048

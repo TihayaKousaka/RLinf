@@ -23,6 +23,9 @@ class Stage2VLAWrapper:
         config_name: str,
         norm_stats_path: str | None = None,
         num_images_in_input: int = 2,
+        num_action_chunks: int = 10,
+        action_dim: int = 8,
+        num_steps: int = 5,
         device: torch.device | str = "cuda",
     ) -> None:
         self.device = torch.device(device)
@@ -35,6 +38,9 @@ class Stage2VLAWrapper:
             "openpi": {
                 "config_name": config_name,
                 "num_images_in_input": num_images_in_input,
+                "action_chunk": int(num_action_chunks),
+                "num_steps": int(num_steps),
+                "action_env_dim": int(action_dim),
                 "train_expert_only": False,
                 "add_value_head": False,
             },
@@ -43,8 +49,8 @@ class Stage2VLAWrapper:
             cfg_dict["openpi_data"] = {"norm_stats_path": norm_stats_path}
         cfg = OmegaConf.create(cfg_dict)
         with open_dict(cfg):
-            cfg.num_action_chunks = 5
-            cfg.action_dim = 7
+            cfg.num_action_chunks = int(num_action_chunks)
+            cfg.action_dim = int(action_dim)
         self.model = get_openpi_model(cfg, torch_dtype=None)
 
         self.model.to(self.device)

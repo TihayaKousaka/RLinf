@@ -59,7 +59,12 @@ def prepare_actions_for_maniskill(
     if policy == "rlt_maniskill":
         reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
         actions = np.asarray(reshaped_actions, dtype=np.float32).copy()
-        actions[:, 3:6] = _euler_xyz_to_rotvec(actions[:, 3:6])
+        # The RLT ManiSkill dataset stores the native normalized
+        # pd_ee_delta_pose action sent to ManiSkill:
+        #   [dx, dy, dz, drotvec_x, drotvec_y, drotvec_z, gripper]
+        # where arm dimensions are in [-1, 1] and map to controller bounds
+        # (+/-0.1 m/rad for Panda), and gripper is +1=open, -1=close.
+        actions[:, :6] = np.clip(actions[:, :6], -1.0, 1.0)
         actions[:, -1] = np.clip(actions[:, -1], -1.0, 1.0)
         return torch.from_numpy(actions).reshape(-1, num_action_chunks, action_dim).cuda()
 

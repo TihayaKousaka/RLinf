@@ -78,6 +78,12 @@ class RecordVideo(gym.Wrapper):
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
+        self._frame_count = 0
+        self._record_every = int(getattr(video_cfg, "record_every", 1) or 1)
+        if self._record_every <= 0:
+            raise ValueError(
+                f"video_cfg.record_every must be positive, got {self._record_every}"
+            )
 
         if fps is not None:
             self._fps = fps
@@ -314,6 +320,10 @@ class RecordVideo(gym.Wrapper):
         """Overlay info (optional) and append a tiled frame."""
         if not images:
             return
+        frame_count = self._frame_count
+        self._frame_count += 1
+        if frame_count % self._record_every != 0:
+            return
         if self.video_cfg.get("info_on_video", True):
             images = [
                 put_info_on_image(
@@ -459,6 +469,10 @@ class RecordVideo(gym.Wrapper):
         frames = list(self.render_images)
         self.render_images = []
         self.video_cnt += 1
+        print(
+            f"[RecordVideo] saving {len(frames)} frames to {mp4_path} "
+            f"at fps={self._fps}, record_every={self._record_every}"
+        )
         self._submit_save(frames, mp4_path)
         if wait:
             self.wait_for_pending_saves()
