@@ -62,7 +62,8 @@ algorithm:
   # 每几个 critic update 更新一次 actor；当前为 2:1 TD3 风格。
   critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
   # Replay buffer 至少达到这个 transition 数后，才允许 actor 更新。
-  actor_warmup_steps: 600
+  # 这里是 transition 数，不是 global step；设高一点让 critic 先稳定，避免 actor 早期偏离 base VLA。
+  actor_warmup_steps: 20000
   # 前 200 个 training update 使用 warmup loss 权重。
   actor_warmup_updates: 200
   # warmup 后再用 400 个 update 从 warmup 权重线性过渡到 online 权重。
@@ -244,7 +245,8 @@ actor:
       # TD3 常用设置：2 次 critic update 对 1 次 actor update。
       critic_updates_per_actor: 2
       # Stage2 自定义 numpy replay buffer 容量；只存 x/action/reward，不存图像。
-      buffer_capacity: 200000
+      # 缩小容量能提高近期 rollout 和 expert intervention 样本占比。
+      buffer_capacity: 50000
       tau: 0.005
       gamma: 0.99
 
