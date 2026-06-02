@@ -16,7 +16,9 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
+    # Actor worker 负责训练 residual actor 和 critic；这里固定放在 rank 0。
     actor: 0-0
+    # Env/Rollout 用 all 是为了最大化并行 rollout；如果显存紧张，可手动拆 rank。
     env: all
     rollout: all
 
@@ -28,43 +30,66 @@ runner:
     experiment_name: "rlt_stage2_maniskill_joint"
     logger_backends: ["wandb"]
 
+  # Runner global step 上限；每个 global step 包含 rollout、收数据、训练和日志。
   max_epochs: 5000
   max_steps: -1
   only_eval: False
+  # 每隔多少个 global step 把 actor 权重同步到 rollout worker。
+  # 太大则 rollout 用旧 actor；太小则通信开销更高。
   weight_sync_interval: 10
+  # Eval/保存间隔，单位是 runner global step。
   val_check_interval: 50
   save_interval: 50
   resume_dir: null
   ckpt_path: null
 
 algorithm:
+  # 每次 actor.run_training() 内部采样并更新几轮。
   update_epoch: 1
   group_size: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
+  # 使用 RLT Stage2 TD3 训练路径。
   adv_type: rlt_td3
   loss_type: rlt_td3
   loss_agg_func: "token-mean"
+  # 训练 worker 只加载小 actor/critic，不加载 VLA/RL-token backbone；
+  # rollout 端负责提取并缓存 x/a_tilde，显著省显存。
   actor_only_train_model: True
+  # TD target 折扣因子和 target critic 软更新系数。
   gamma: 0.99
   tau: 0.005
+  # 每几个 critic update 更新一次 actor；当前为 2:1 TD3 风格。
   critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
+  # Replay buffer 至少达到这个 transition 数后，才允许 actor 更新。
   actor_warmup_steps: 600
+  # 前 200 个 training update 使用 warmup loss 权重。
   actor_warmup_updates: 200
+  # warmup 后再用 400 个 update 从 warmup 权重线性过渡到 online 权重。
   actor_loss_ramp_updates: 400
   target_update_freq: 1
   intervention:
+    # Expert intervention：用强 VLA 模拟人在环接管。
     enable: True
+    # 用 train env 的 success_once 判断是否需要接管；该指标有噪声。
     success_metric: "env/success_once"
+    # 前 10 个 rollout 估计 baseline；当前取这段里的最小值作为 baseline。
     baseline_warmup_steps: 10
+    # 低于 baseline * (1 - 0.20) = baseline * 0.8 才认为崩。
     relative_drop: 0.20
+    # 连续 3 个 rollout 低于阈值才触发 expert，避免单步噪声误触发。
     trigger_patience: 3
+    # 触发后连续 3 个 rollout 开 expert，避免 0/1 尖峰式抖动。
     intervention_rollouts: 3
+    # 触发 intervention 时完整使用 expert；设小于 1 会混入学生动作。
     probability: 1.0
   replay_buffer:
+    # 这几个 cache/window 字段是 RLinf 通用 replay 配置；
+    # 当前 RLTStage2ReplayBuffer 主要使用 min_buffer_size。
     enable_cache: True
     cache_size: 10000
     sample_window_size: 10000
+    # buffer 少于 600 条 transition 时不训练。
     min_buffer_size: 600
     auto_save: False
   sampling_params:
@@ -82,34 +107,44 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
+    # 并行训练环境数；越大 rollout 数据越多，但仿真/显存/CPU 压力越高。
     total_num_envs: 32
+    # True 表示 episode done 后自动 reset；train env/success_once 只统计已 done episode。
     auto_reset: True
     ignore_terminations: False
+    # Train 不固定 reset ids，会受 seed 和 auto-reset 影响；eval 固定，更适合看真实性能。
     use_fixed_reset_state_ids: False
+    # RLT joint-control 观测包装：图像 + joint proprio + prompt。
     wrap_obs_mode: rlt_openpi_joint
+    # 只用 success 作为训练 reward；底层 ManiSkill 仍是 sparse。
     reward_mode: only_success
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
     init_params:
       id: "PegInsertionSideWideClearance-v1"
       obs_mode: "rgb"
+      # Joint delta position 控制，action_dim 当前为 8。
       control_mode: "pd_joint_delta_pos"
       reward_mode: "sparse"
       sim_config:
+        # 物理仿真 100Hz，控制 10Hz，即每个控制动作持续约 0.1s。
         sim_freq: 100
         control_freq: 10
       sensor_configs:
         width: 384
         height: 384
   eval:
+    # Eval 环境数；eval/success_once 比 train env/success_once 更可信。
     total_num_envs: 32
     auto_reset: True
     ignore_terminations: False
+    # 固定 reset ids，保证不同 checkpoint 评估口径一致。
     use_fixed_reset_state_ids: True
     wrap_obs_mode: rlt_openpi_joint
     reward_mode: only_success
     max_episode_steps: 500
     max_steps_per_rollout_epoch: 500
+    # Eval 时每次执行完整 10-step action chunk。
     action_exec_chunks: 10
     group_size: 1
     video_cfg:
@@ -134,14 +169,18 @@ rollout:
   backend: "huggingface"
   enable_offload: False
   pipeline_stage_num: 1
+  # Stage2 需要收集 trajectory 并发送给 actor worker 进入 replay buffer。
   collect_transitions: True
   collect_prev_infos: True
   model:
+    # rollout 学生模型路径跟 actor.model 保持一致；权重后续由 actor 同步。
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
   expert_model:
+    # 强 expert，用来模拟 human intervention。
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor"
     precision: null
+    # True 表示 expert 只作为 VLA reference action，不加载/使用 Stage2 actor residual。
     act_as_vla_reference: True
   enable_torch_compile: False
   enable_cuda_graph: False
@@ -149,14 +188,18 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
+  # 单个 micro batch 大小；global_batch_size 会按 world size 切分。
   micro_batch_size: 128
+  # 每个 training update 从 replay buffer 采样的总 batch。
   global_batch_size: 512
   seed: 1234
   enable_offload: False
   model:
+    # 学生/base VLA checkpoint。Stage2 actor 在它的 reference action 附近学习 residual。
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor"
     precision: null
     load_to_device: True
+    # 一次输出 10 个动作，每个 joint action 8 维。
     num_action_chunks: 10
     action_dim: 8
     add_value_head: False
@@ -164,38 +207,55 @@ actor:
     num_steps: 5
     rlt_stage2:
       config_name: "pi05_rlt_maniskill_joint"
+      # 与学生/base VLA 对齐的数据归一化统计。
       norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_joint/norm_stats.json"
+      # Stage1 训练出的 RL token checkpoint。
       rl_token_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260601-10:47:29/rlt_stage1_maniskill_joint/checkpoints/global_step_3000/actor/rl_token/rl_token_model.pt"
+      # 使用主视角 + wrist 视角。
       num_images_in_input: 2
+      # joint proprio 维度；x = [z_rl, proprio]。
       proprio_dim: 9
+      # RL token embedding 维度。
       embedding_dim: 2048
       encoder_layers: 2
       encoder_heads: 8
       decoder_layers: 2
       decoder_heads: 8
+      # residual actor 和 twin-Q critic 的 MLP 宽度/层数。
       mlp_hidden_dim: 256
       mlp_num_hidden_layers: 2
+      # train rollout actor action noise；越大探索越强，也越容易偏离 base VLA。
       actor_noise_sigma: 0.002
+      # 训练 actor 时随机把一部分 a_tilde 输入置零，防止只复制 reference。
       ref_action_dropout: 0.5
+      # TD3 target policy smoothing 噪声。
       target_noise_sigma: 0.05
       target_noise_clip: 0.1
+      # 论文中的 BC regularizer beta 默认值；实际当前用 warmup/online 权重覆盖。
       bc_regularizer_beta: 5.0
+      # warmup 阶段：高 BC、低 Q，防止 actor 早期被不准的 critic 拉偏。
       warmup_bc_weight: 7.0
       warmup_q_weight: 0.05
+      # online 阶段：降低 BC、提高 Q，让 actor 有空间改进 base VLA。
       online_bc_weight: 3.0
       online_q_weight: 0.1
+      # chunk 内动作差分正则；当前关掉。
       delta_weight: 0.0
+      # TD3 常用设置：2 次 critic update 对 1 次 actor update。
       critic_updates_per_actor: 2
+      # Stage2 自定义 numpy replay buffer 容量；只存 x/action/reward，不存图像。
       buffer_capacity: 200000
       tau: 0.005
       gamma: 0.99
 
   optim:
+    # actor optimizer；lr 太大容易让 residual 很快偏离 base VLA。
     clip_grad: 10.0
     lr: 3.0e-5
     lr_scheduler: torch_constant
 
   critic_optim:
+    # critic optimizer；critic 不稳时 actor 会被错误 Q 方向带偏。
     clip_grad: 10.0
     lr: 3.0e-5
     lr_scheduler: torch_constant
