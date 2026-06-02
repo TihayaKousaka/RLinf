@@ -45,6 +45,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.qf_lr_scheduler = None
         self.update_step = 0
         self.gradient_accumulation = 1
+        self.actor_only_train_model = bool(
+            cfg.algorithm.get("actor_only_train_model", True)
+        )
+        self._rollout_sync_key_count = 0
 
         weight_syncer_cfg = cfg.get("weight_syncer", None)
         assert weight_syncer_cfg is not None, (
@@ -52,7 +56,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
-    def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool]:
+    def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool, float]:
         stage2_cfg = self.cfg.actor.model.rlt_stage2
         warmup_updates = int(
             self.cfg.algorithm.get(
@@ -61,24 +65,45 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             )
         )
         in_warmup = self.update_step < warmup_updates
+        warmup_bc_weight = float(
+            stage2_cfg.get(
+                "warmup_bc_weight",
+                stage2_cfg.get("bc_regularizer_beta", 1.0),
+            )
+        )
+        warmup_q_weight = float(stage2_cfg.get("warmup_q_weight", 0.1))
+        online_bc_weight = float(
+            stage2_cfg.get(
+                "online_bc_weight",
+                stage2_cfg.get("bc_regularizer_beta", 1.0),
+            )
+        )
+        online_q_weight = float(stage2_cfg.get("online_q_weight", 0.1))
         if in_warmup:
-            bc_weight = float(
-                stage2_cfg.get(
-                    "warmup_bc_weight",
-                    stage2_cfg.get("bc_regularizer_beta", 1.0),
-                )
-            )
-            q_weight = float(stage2_cfg.get("warmup_q_weight", 0.1))
+            bc_weight = warmup_bc_weight
+            q_weight = warmup_q_weight
+            ramp_progress = 0.0
         else:
-            bc_weight = float(
-                stage2_cfg.get(
-                    "online_bc_weight",
-                    stage2_cfg.get("bc_regularizer_beta", 1.0),
+            ramp_updates = int(self.cfg.algorithm.get("actor_loss_ramp_updates", 0))
+            if ramp_updates > 0:
+                ramp_progress = min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(self.update_step - warmup_updates + 1)
+                        / float(ramp_updates),
+                    ),
                 )
+            else:
+                ramp_progress = 1.0
+            bc_weight = warmup_bc_weight + ramp_progress * (
+                online_bc_weight - warmup_bc_weight
             )
-            q_weight = float(stage2_cfg.get("online_q_weight", 0.1))
+            q_weight = warmup_q_weight + ramp_progress * (
+                online_q_weight - warmup_q_weight
+            )
         delta_weight = float(stage2_cfg.get("delta_weight", 0.0))
-        return bc_weight, q_weight, delta_weight, in_warmup
+        return bc_weight, q_weight, delta_weight, in_warmup, ramp_progress
 
     def init_worker(self):
         self.setup_model_and_optimizer()
@@ -104,7 +129,19 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
     def model_provider_func(self) -> torch.nn.Module:
         from rlinf.models import get_model
 
-        model = get_model(self.cfg.actor.model)
+        model_cfg = self.cfg.actor.model
+        if bool(
+            self.actor_only_train_model
+        ) and model_cfg.get("rlt_stage2", None) is not None:
+            from copy import deepcopy
+            from omegaconf import open_dict
+
+            model_cfg = deepcopy(model_cfg)
+            with open_dict(model_cfg):
+                model_cfg.rlt_stage2.load_feature_backbones = False
+                model_cfg.rlt_stage2.load_rl_token_model = False
+
+        model = get_model(model_cfg)
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path, map_location="cpu")
             model.load_state_dict(model_dict)
@@ -158,7 +195,11 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
 
     def get_rollout_state_dict(self) -> dict:
-        return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        state_dict = self.model.filter_rollout_state_dict(
+            self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        )
+        self._rollout_sync_key_count = len(state_dict)
+        return state_dict
 
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
@@ -208,65 +249,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
         if self.enable_offload:
             self.offload_param_and_grad(True)
-
-    def _clone_env_obs_for_encode(
-        self,
-        obs_dict: dict[str, Any],
-        *,
-        step_idx: int,
-        env_idx: int,
-    ) -> dict[str, Any]:
-        sample: dict[str, Any] = {}
-        for key, value in obs_dict.items():
-            if isinstance(value, torch.Tensor):
-                if value.dim() >= 2:
-                    sample[key] = value[step_idx, env_idx].unsqueeze(0).clone()
-                elif value.dim() == 1:
-                    sample[key] = value[env_idx].unsqueeze(0).clone()
-                else:
-                    sample[key] = value.clone()
-            elif isinstance(value, list):
-                if len(value) > step_idx and isinstance(value[step_idx], list):
-                    sample[key] = [value[step_idx][env_idx]]
-                elif len(value) > env_idx:
-                    sample[key] = [value[env_idx]]
-                else:
-                    sample[key] = value
-            else:
-                sample[key] = value
-        return sample
-
-    @torch.no_grad()
-    def _encode_single_obs(self, obs: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-        x, a_tilde = self.model.encode_obs(obs)
-        return (
-            x.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False),
-            a_tilde.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False),
-        )
-
-    def _build_next_obs_with_prompt(
-        self,
-        traj: Trajectory,
-        *,
-        env_idx: int,
-        prompt_step_idx: int,
-    ) -> dict[str, Any]:
-        next_obs = self._clone_env_obs_for_encode(
-            traj.next_obs,
-            step_idx=prompt_step_idx,
-            env_idx=env_idx,
-        )
-        next_obs["tokenized_prompt"] = (
-            traj.forward_inputs["tokenized_prompt"][prompt_step_idx, env_idx]
-            .unsqueeze(0)
-            .clone()
-        )
-        next_obs["tokenized_prompt_mask"] = (
-            traj.forward_inputs["tokenized_prompt_mask"][prompt_step_idx, env_idx]
-            .unsqueeze(0)
-            .clone()
-        )
-        return next_obs
 
     def _trajectory_to_transitions(self, traj: Trajectory) -> int:
         if self.replay_buffer is None or traj.actions is None or not traj.forward_inputs:
@@ -323,12 +305,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 )
 
                 if done > 0.0:
-                    next_obs = self._build_next_obs_with_prompt(
-                        traj,
-                        env_idx=env_idx,
-                        prompt_step_idx=t,
-                    )
-                    next_x, next_a_tilde = self._encode_single_obs(next_obs)
+                    next_x = x
+                    next_a_tilde = a_tilde
                 elif t + 1 < traj_len:
                     next_x = (
                         x_all[t + 1, env_idx]
@@ -345,12 +323,27 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         .astype(np.float32, copy=False)
                     )
                 else:
-                    next_obs = self._build_next_obs_with_prompt(
-                        traj,
-                        env_idx=env_idx,
-                        prompt_step_idx=t,
+                    if x_all.shape[0] <= t + 1 or a_tilde_all.shape[0] <= t + 1:
+                        raise RuntimeError(
+                            "RLT Stage2 rollout boundary transition is non-terminal "
+                            "but missing cached final x/a_tilde. Rollout must send "
+                            "the final student forward_inputs so actor training can "
+                            "bootstrap without re-encoding VLA observations."
+                        )
+                    next_x = (
+                        x_all[t + 1, env_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False)
                     )
-                    next_x, next_a_tilde = self._encode_single_obs(next_obs)
+                    next_a_tilde = (
+                        a_tilde_all[t + 1, env_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False)
+                    )
 
                 self.replay_buffer.add(
                     x=x,
@@ -421,6 +414,17 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         stats = self.replay_buffer.get_stats()
         for key, value in stats.items():
             append_to_dict(metrics, {f"replay_buffer/{key}": value})
+        append_to_dict(
+            metrics,
+            {
+                "rlt_stage2/actor_only_train_model": float(
+                    self.actor_only_train_model
+                ),
+                "rlt_stage2/rollout_sync_key_count": float(
+                    self._rollout_sync_key_count
+                ),
+            },
+        )
         return self._process_train_metrics(metrics)
 
     def _update_one_epoch(self, micro_batches: list[dict[str, torch.Tensor]]) -> dict[str, float]:
@@ -478,7 +482,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             self.cfg.algorithm.get("actor_warmup_steps", min_buffer_size)
         )
         actor_warmup_done = len(self.replay_buffer) >= actor_warmup_steps
-        bc_weight, q_weight, delta_weight, in_loss_warmup = (
+        bc_weight, q_weight, delta_weight, in_loss_warmup, loss_ramp_progress = (
             self._resolve_actor_loss_weights()
         )
         update_actor = (
@@ -565,6 +569,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/bc_loss": float(np.mean(actor_bc_losses)),
                     "actor/delta_loss": float(np.mean(actor_delta_losses)),
                     "actor/loss_warmup": float(in_loss_warmup),
+                    "actor/loss_ramp_progress": loss_ramp_progress,
                 }
             )
         else:
@@ -577,6 +582,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/q_weight": q_weight,
                     "actor/delta_weight": delta_weight,
                     "actor/loss_warmup": float(in_loss_warmup),
+                    "actor/loss_ramp_progress": loss_ramp_progress,
                 }
             )
 

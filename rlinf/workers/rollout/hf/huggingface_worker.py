@@ -53,6 +53,8 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_epoch = cfg.algorithm.get("rollout_epoch", 1)
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
+        self._expert_model_config = None
+        self._has_expert_model_config = self.cfg.rollout.get("expert_model", None) is not None
 
         # Sync weight comm options
         max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
@@ -138,23 +140,9 @@ class MultiStepRolloutWorker(Worker):
             self.hf_model.load_state_dict(model_dict)
 
         if self.cfg.rollout.get("expert_model", None):
-            expert_model_config = copy.deepcopy(self.cfg.actor.model)
-            with open_dict(expert_model_config):
-                expert_model_config.precision = self.cfg.rollout.expert_model.precision
-                expert_model_config.model_path = (
-                    self.cfg.rollout.expert_model.model_path
-                )
-                if expert_model_config.get("rlt_stage2", None) is not None:
-                    expert_model_config.rlt_stage2.act_as_vla_reference = (
-                        self.cfg.rollout.expert_model.get(
-                            "act_as_vla_reference", self._is_rlt_stage2_td3()
-                        )
-                    )
-            self.expert_model = get_model(expert_model_config)
-
-            if self.cfg.runner.get("expert_ckpt_path", None):
-                expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
-                self.expert_model.load_state_dict(expert_model_dict)
+            self._expert_model_config = self._build_expert_model_config()
+            if not self._is_rlt_stage2_td3():
+                self._ensure_expert_model_loaded()
 
         self.hf_model.eval()
         if self.expert_model is not None:
@@ -198,6 +186,38 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.offload_model()
 
+    def _build_expert_model_config(self):
+        expert_model_config = copy.deepcopy(self.cfg.actor.model)
+        with open_dict(expert_model_config):
+            expert_model_config.precision = self.cfg.rollout.expert_model.precision
+            expert_model_config.model_path = self.cfg.rollout.expert_model.model_path
+            if expert_model_config.get("rlt_stage2", None) is not None:
+                act_as_vla_reference = self.cfg.rollout.expert_model.get(
+                    "act_as_vla_reference", self._is_rlt_stage2_td3()
+                )
+                expert_model_config.rlt_stage2.act_as_vla_reference = (
+                    act_as_vla_reference
+                )
+                if act_as_vla_reference:
+                    expert_model_config.rlt_stage2.load_feature_backbones = True
+                    expert_model_config.rlt_stage2.load_rl_token_model = False
+        return expert_model_config
+
+    def _ensure_expert_model_loaded(self):
+        if self.expert_model is not None:
+            return self.expert_model
+        if self._expert_model_config is None:
+            raise RuntimeError(
+                "Expert intervention was requested, but rollout.expert_model is not configured."
+            )
+
+        self.expert_model = get_model(self._expert_model_config)
+        if self.cfg.runner.get("expert_ckpt_path", None):
+            expert_model_dict = torch.load(self.cfg.runner.expert_ckpt_path)
+            self.expert_model.load_state_dict(expert_model_dict)
+        self.expert_model.eval()
+        return self.expert_model
+
     def setup_sample_params(self):
         # length parameters for rollout
         self._length_params = OmegaConf.to_container(
@@ -227,7 +247,7 @@ class MultiStepRolloutWorker(Worker):
             "max_new_tokens": self._length_params["max_new_token"],
         }
 
-        if self.expert_model is not None:
+        if self._has_expert_model_config:
             intervention_cfg = self.cfg.algorithm.get("intervention", {})
             default_beta = intervention_cfg.get(
                 "probability",
@@ -245,7 +265,7 @@ class MultiStepRolloutWorker(Worker):
             }
 
     def update_dagger_beta(self):
-        if self.expert_model is None:
+        if not self._has_expert_model_config:
             return
         if self._is_rlt_stage2_td3():
             return
@@ -297,7 +317,11 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        *,
+        allow_expert: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -333,7 +357,8 @@ class MultiStepRolloutWorker(Worker):
 
         if (
             mode == "train"
-            and self.expert_model is not None
+            and allow_expert
+            and self._has_expert_model_config
             and (not is_rlt_stage2_td3 or self.intervention_enabled)
         ):
             use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
@@ -348,10 +373,19 @@ class MultiStepRolloutWorker(Worker):
                     env_obs=env_obs,
                     **kwargs,
                 )
-                actions, _ = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
+                expert_model = self._ensure_expert_model_loaded()
+                if getattr(expert_model, "act_as_vla_reference", False) and hasattr(
+                    expert_model, "predict_vla_reference_action_batch"
+                ):
+                    actions, _ = expert_model.predict_vla_reference_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
+                else:
+                    actions, _ = expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
                 action_flat = actions.reshape(actions.shape[0], -1)
                 forward_inputs = result["forward_inputs"]
                 if "a_tilde" in forward_inputs:
@@ -366,7 +400,7 @@ class MultiStepRolloutWorker(Worker):
                 )
                 expert_label_flag = True
             elif use_expert:
-                actions, result = self.expert_model.predict_action_batch(
+                actions, result = self._ensure_expert_model_loaded().predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
                 )
@@ -382,10 +416,10 @@ class MultiStepRolloutWorker(Worker):
                 not is_rlt_stage2_td3
                 and not only_save_expert  # only re-label in classic dagger mode
                 and not use_expert  # only re-label if not using expert
-                and self.expert_model is not None  # only re-label if expert exists
+                and self._has_expert_model_config  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
             ):
-                _, expert_result = self.expert_model.predict_action_batch(
+                _, expert_result = self._ensure_expert_model_loaded().predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
                 )
@@ -454,6 +488,7 @@ class MultiStepRolloutWorker(Worker):
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
+        is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
 
         async def recv_func() -> Any:
             data = await self.recv(
@@ -475,7 +510,9 @@ class MultiStepRolloutWorker(Worker):
 
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
+                state_dict=self.hf_model.rollout_state_dict()
+                if is_rlt_stage2_td3
+                else self.hf_model.state_dict(),
                 recv=recv_func,
                 send=send_func,
             )
@@ -532,14 +569,21 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
+            actions, result = self.predict(
+                env_output["obs"],
+                allow_expert=False,
+            )
 
+            forward_inputs = (
+                result["forward_inputs"] if self._is_rlt_stage2_td3() else {}
+            )
             rollout_result = RolloutResult(
                 actions=actions,
                 prev_values=result["prev_values"] if self.collect_prev_infos else None,
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
+                forward_inputs=forward_inputs,
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 
@@ -582,10 +626,14 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
+        if self.expert_model is not None:
+            self.expert_model.to("cpu")
         self.torch_platform.empty_cache()
 
     def reload_model(self):
         self.hf_model.to(self.device)
+        if self.expert_model is not None:
+            self.expert_model.to(self.device)
         if self.enable_cuda_graph:
             self.hf_model.capture_cuda_graph(
                 train_batch_size=self.train_batch_size,

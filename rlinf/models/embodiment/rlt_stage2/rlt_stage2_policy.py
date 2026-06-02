@@ -25,6 +25,8 @@ from .vla_wrapper import Stage2VLAWrapper
 
 
 class RLTStage2Policy(torch.nn.Module, BasePolicy):
+    ROLLOUT_SYNC_PREFIXES = ("actor.",)
+
     def __init__(
         self,
         cfg: DictConfig,
@@ -41,32 +43,42 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self.action_chunk_dim = self.chunk_length * self.action_dim
         self.proprio_dim = int(stage2_cfg.get("proprio_dim", self.action_dim))
         self.act_as_vla_reference = bool(stage2_cfg.get("act_as_vla_reference", False))
-
-        self.vla = Stage2VLAWrapper(
-            model_path=cfg.model_path,
-            config_name=stage2_cfg.config_name,
-            norm_stats_path=stage2_cfg.get("norm_stats_path", None),
-            num_images_in_input=int(stage2_cfg.get("num_images_in_input", 1)),
-            num_action_chunks=self.chunk_length,
-            action_dim=self.action_dim,
-            num_steps=int(stage2_cfg.get("num_steps", cfg.get("num_steps", 5))),
-            device=self.device,
+        self.load_feature_backbones = bool(
+            stage2_cfg.get("load_feature_backbones", True)
+        )
+        self.load_rl_token_model = bool(
+            stage2_cfg.get("load_rl_token_model", self.load_feature_backbones)
         )
 
-        self.rl_token_model = RLTokenModel(
-            embedding_dim=int(stage2_cfg.get("embedding_dim", 2048)),
-            encoder_layers=int(stage2_cfg.get("encoder_layers", 2)),
-            encoder_heads=int(stage2_cfg.get("encoder_heads", 8)),
-            decoder_layers=int(stage2_cfg.get("decoder_layers", 2)),
-            decoder_heads=int(stage2_cfg.get("decoder_heads", 8)),
-        ).to(self.device)
-        rl_token_ckpt = torch.load(stage2_cfg.rl_token_path, map_location="cpu")
-        if "model_state_dict" in rl_token_ckpt:
-            rl_token_ckpt = rl_token_ckpt["model_state_dict"]
-        self.rl_token_model.load_state_dict(rl_token_ckpt, strict=False)
-        self.rl_token_model.eval()
-        for param in self.rl_token_model.parameters():
-            param.requires_grad_(False)
+        self.vla = None
+        self.rl_token_model = None
+        if self.load_feature_backbones:
+            self.vla = Stage2VLAWrapper(
+                model_path=cfg.model_path,
+                config_name=stage2_cfg.config_name,
+                norm_stats_path=stage2_cfg.get("norm_stats_path", None),
+                num_images_in_input=int(stage2_cfg.get("num_images_in_input", 1)),
+                num_action_chunks=self.chunk_length,
+                action_dim=self.action_dim,
+                num_steps=int(stage2_cfg.get("num_steps", cfg.get("num_steps", 5))),
+                device=self.device,
+            )
+
+        if self.load_rl_token_model:
+            self.rl_token_model = RLTokenModel(
+                embedding_dim=int(stage2_cfg.get("embedding_dim", 2048)),
+                encoder_layers=int(stage2_cfg.get("encoder_layers", 2)),
+                encoder_heads=int(stage2_cfg.get("encoder_heads", 8)),
+                decoder_layers=int(stage2_cfg.get("decoder_layers", 2)),
+                decoder_heads=int(stage2_cfg.get("decoder_heads", 8)),
+            ).to(self.device)
+            rl_token_ckpt = torch.load(stage2_cfg.rl_token_path, map_location="cpu")
+            if "model_state_dict" in rl_token_ckpt:
+                rl_token_ckpt = rl_token_ckpt["model_state_dict"]
+            self.rl_token_model.load_state_dict(rl_token_ckpt, strict=False)
+            self.rl_token_model.eval()
+            for param in self.rl_token_model.parameters():
+                param.requires_grad_(False)
 
         embedding_dim = int(stage2_cfg.get("embedding_dim", 2048))
         self.state_dim = embedding_dim + self.proprio_dim
@@ -90,6 +102,52 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
     @staticmethod
     def _shape_str(tensor: torch.Tensor | None) -> str:
         return "None" if tensor is None else str(tuple(getattr(tensor, "shape", ())))
+
+    @staticmethod
+    def _normalize_state_dict_key(key: str) -> str:
+        for prefix in ("_fsdp_wrapped_module.", "module."):
+            if key.startswith(prefix):
+                return key[len(prefix) :]
+        return key
+
+    @classmethod
+    def _is_rollout_sync_key(cls, key: str) -> bool:
+        normalized_key = cls._normalize_state_dict_key(key)
+        return any(
+            normalized_key.startswith(prefix) for prefix in cls.ROLLOUT_SYNC_PREFIXES
+        )
+
+    @classmethod
+    def filter_rollout_state_dict(cls, state_dict: dict[str, Any]) -> dict[str, Any]:
+        filtered: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            normalized_key = cls._normalize_state_dict_key(key)
+            if not cls._is_rollout_sync_key(normalized_key):
+                continue
+            if normalized_key in filtered:
+                raise ValueError(
+                    "Duplicate RLT Stage2 rollout sync key after normalization: "
+                    f"{normalized_key}"
+                )
+            filtered[normalized_key] = value
+        if not filtered:
+            raise ValueError(
+                "RLT Stage2 rollout sync state_dict is empty. Expected actor.* "
+                "parameters for residual actor weight sync."
+            )
+        return filtered
+
+    def rollout_state_dict(self) -> dict[str, Any]:
+        return self.filter_rollout_state_dict(self.state_dict())
+
+    def _require_feature_backbones(self, caller: str) -> None:
+        if self.vla is None or self.rl_token_model is None:
+            raise RuntimeError(
+                f"RLT Stage2 {caller} requires VLA/RL-token feature backbones, "
+                "but this policy was initialized with "
+                "rlt_stage2.load_feature_backbones=False. This mode is only "
+                "valid for actor/critic training on cached rollout features."
+            )
 
     def _validate_action_chunk(self, tensor: torch.Tensor | None, *, name: str) -> None:
         expected_tail = (self.chunk_length, self.action_dim)
@@ -140,6 +198,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self,
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        self._require_feature_backbones("_prepare_features")
         observation, processed_obs = self.vla.prepare_obs(env_obs)
         embeddings, pad_mask = self.vla.extract_embeddings(observation)
         z_rl = self.rl_token_model.encode(embeddings, pad_mask)
@@ -233,6 +292,41 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         env_obs: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._encode_state_and_reference(env_obs)
+
+    @torch.no_grad()
+    def predict_vla_reference_action_batch(
+        self,
+        env_obs,
+        mode: Literal["train", "eval"] = "eval",
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del mode, kwargs
+        if self.vla is None:
+            raise RuntimeError(
+                "RLT Stage2 VLA reference prediction requires the VLA backbone. "
+                "Do not call this method on actor-only training policies."
+            )
+        observation, processed_obs = self.vla.prepare_obs(env_obs)
+        a_tilde = self.vla.get_rl_chunk_reference(observation, self.chunk_length)
+        self._validate_action_chunk(a_tilde, name="expert vla_reference actions")
+        action_flat = a_tilde.reshape(a_tilde.shape[0], -1)
+        self._validate_flat_action(action_flat, name="expert vla_reference action_flat")
+        zeros = torch.zeros(
+            action_flat.shape[0], 1, device=action_flat.device, dtype=torch.float32
+        )
+        result = {
+            "prev_logprobs": zeros,
+            "prev_values": zeros,
+            "forward_inputs": {
+                "action": action_flat.detach(),
+                "a_tilde": action_flat.detach(),
+                "tokenized_prompt": processed_obs["tokenized_prompt"].detach(),
+                "tokenized_prompt_mask": processed_obs[
+                    "tokenized_prompt_mask"
+                ].detach(),
+            },
+        }
+        return a_tilde, result
 
     def sac_forward(
         self,

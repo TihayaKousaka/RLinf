@@ -101,6 +101,9 @@ class EmbodiedRunner:
             self.cfg.runner.get("per_worker_log", False)
         )
         self.intervention_success_baseline = None
+        self.intervention_baseline_samples: list[float] = []
+        self.intervention_bad_streak = 0
+        self.intervention_active_rollouts_left = 0
 
         # Async logging setup
         self.stop_logging = False
@@ -118,28 +121,68 @@ class EmbodiedRunner:
             return {}
 
         current_success = float(env_metrics[success_key])
+        baseline_warmup_steps = max(
+            1, int(intervention_cfg.get("baseline_warmup_steps", 1))
+        )
+        trigger_patience = max(
+            1, int(intervention_cfg.get("trigger_patience", 1))
+        )
+        intervention_rollouts = max(
+            1, int(intervention_cfg.get("intervention_rollouts", 1))
+        )
+        relative_drop = float(intervention_cfg.get("relative_drop", 0.10))
         if self.intervention_success_baseline is None:
-            self.intervention_success_baseline = current_success
+            self.intervention_baseline_samples.append(current_success)
             enabled = False
+            if len(self.intervention_baseline_samples) >= baseline_warmup_steps:
+                self.intervention_success_baseline = min(
+                    self.intervention_baseline_samples[-baseline_warmup_steps:]
+                )
+            baseline_for_log = min(self.intervention_baseline_samples)
+            threshold = baseline_for_log * (1.0 - relative_drop)
+            is_below_threshold = False
         else:
-            relative_drop = float(intervention_cfg.get("relative_drop", 0.10))
             threshold = self.intervention_success_baseline * (1.0 - relative_drop)
-            enabled = current_success < threshold
+            baseline_for_log = float(self.intervention_success_baseline)
+            is_below_threshold = current_success < threshold
+            if self.intervention_active_rollouts_left > 0:
+                enabled = True
+                self.intervention_active_rollouts_left -= 1
+                if not is_below_threshold:
+                    self.intervention_bad_streak = 0
+            else:
+                if is_below_threshold:
+                    self.intervention_bad_streak += 1
+                else:
+                    self.intervention_bad_streak = 0
+
+                enabled = self.intervention_bad_streak >= trigger_patience
+                if enabled:
+                    self.intervention_active_rollouts_left = intervention_rollouts - 1
+                    self.intervention_bad_streak = 0
 
         self.rollout.set_intervention_state(
             enabled=enabled,
-            success_baseline=float(self.intervention_success_baseline),
+            success_baseline=float(baseline_for_log),
             last_success=current_success,
         ).wait()
 
         return {
-            "intervention/success_baseline": float(self.intervention_success_baseline),
+            "intervention/success_baseline": float(baseline_for_log),
             "intervention/last_success": current_success,
             "intervention/enabled_next_rollout": float(enabled),
-            "intervention/relative_drop_threshold": float(
-                self.intervention_success_baseline
-                * (1.0 - float(intervention_cfg.get("relative_drop", 0.10)))
+            "intervention/relative_drop_threshold": float(threshold),
+            "intervention/below_threshold": float(is_below_threshold),
+            "intervention/bad_streak": float(self.intervention_bad_streak),
+            "intervention/trigger_patience": float(trigger_patience),
+            "intervention/active_rollouts_left": float(
+                self.intervention_active_rollouts_left
             ),
+            "intervention/intervention_rollouts": float(intervention_rollouts),
+            "intervention/baseline_warmup_count": float(
+                min(len(self.intervention_baseline_samples), baseline_warmup_steps)
+            ),
+            "intervention/baseline_warmup_steps": float(baseline_warmup_steps),
         }
 
     def _log_worker(self):

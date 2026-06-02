@@ -1153,10 +1153,19 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
+                final_forward_inputs = (
+                    rollout_result.forward_inputs
+                    if (
+                        self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
+                        and self.cfg.actor.model.get("model_type", None) == "rlt_stage2"
+                    )
+                    else {}
+                )
                 chunk_step_result = ChunkStepResult(
                     prev_values=(
                         rollout_result.prev_values if self.collect_prev_infos else None
                     ),
+                    forward_inputs=final_forward_inputs,
                     dones=env_output.dones,
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
