@@ -115,6 +115,8 @@ class EmbodiedRunner:
         intervention_cfg = self.cfg.algorithm.get("intervention", {})
         if not intervention_cfg.get("enable", False):
             return {}
+        if intervention_cfg.get("mode", None) == "local_correction":
+            return {}
 
         success_key = intervention_cfg.get("success_metric", "env/success_once")
         if success_key not in env_metrics:

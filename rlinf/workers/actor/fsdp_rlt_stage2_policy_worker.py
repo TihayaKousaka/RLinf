@@ -49,6 +49,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             cfg.algorithm.get("actor_only_train_model", True)
         )
         self._rollout_sync_key_count = 0
+        self.transitions_since_train = 0
+        self.non_rl_transitions_since_train = 0
+        self.episodes_since_train = 0
+        self.total_transitions_added = 0
+        self.total_non_rl_transitions = 0
+        self.total_episodes_added = 0
 
         weight_syncer_cfg = cfg.get("weight_syncer", None)
         assert weight_syncer_cfg is not None, (
@@ -58,13 +64,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
     def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool, float]:
         stage2_cfg = self.cfg.actor.model.rlt_stage2
-        warmup_updates = int(
-            self.cfg.algorithm.get(
-                "actor_warmup_updates",
-                self.cfg.algorithm.get("actor_warmup_steps", 0),
-            )
+        loss_warmup_updates = int(
+            self.cfg.algorithm.get("actor_loss_warmup_updates", 0)
         )
-        in_warmup = self.update_step < warmup_updates
+        in_warmup = self.update_step < loss_warmup_updates
         warmup_bc_weight = float(
             stage2_cfg.get(
                 "warmup_bc_weight",
@@ -90,7 +93,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     1.0,
                     max(
                         0.0,
-                        float(self.update_step - warmup_updates + 1)
+                        float(self.update_step - loss_warmup_updates + 1)
                         / float(ramp_updates),
                     ),
                 )
@@ -245,36 +248,68 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 recv=recv_func,
             )
 
-        await self.weight_syncer.sync(state_dict, send_func, version=self.version)
+        # Rollout uses this version as the number of completed TD3 updates.
+        # Do not send runner global_step here, otherwise warmup/intervention
+        # gates open before any actor/critic update has actually happened.
+        await self.weight_syncer.sync(state_dict, send_func, version=self.update_step)
 
         if self.enable_offload:
             self.offload_param_and_grad(True)
 
-    def _trajectory_to_transitions(self, traj: Trajectory) -> int:
+    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int, int]:
         if self.replay_buffer is None or traj.actions is None or not traj.forward_inputs:
-            return 0
+            return 0, 0, 0
 
         traj_len = traj.actions.shape[0]
         bsz = traj.actions.shape[1]
         added = 0
+        skipped_non_rl = 0
+        completed_episodes = 0
 
         x_all = traj.forward_inputs.get("x")
         a_tilde_all = traj.forward_inputs.get("a_tilde")
         if x_all is None or a_tilde_all is None:
-            return 0
+            return 0, 0, 0
 
         dones_all = traj.dones
         rewards_all = traj.rewards
         if dones_all is None or rewards_all is None:
-            return 0
+            return 0, 0, 0
         intervention_flags_all = traj.forward_inputs.get("intervention_flags")
         if intervention_flags_all is None:
             intervention_flags_all = traj.intervene_flags
+        rl_phase_all = traj.forward_inputs.get("rl_phase")
+        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
 
         for env_idx in range(bsz):
             for t in range(traj_len):
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
-                done = float(dones_all[done_idx, env_idx].any().item())
+                env_done = float(dones_all[done_idx, env_idx].any().item())
+                in_rl_phase = True
+                next_in_rl_phase = True
+                if rl_phase_all is not None:
+                    in_rl_phase = bool(
+                        rl_phase_all[t, env_idx].detach().bool().any().item()
+                    )
+                    if t + 1 < rl_phase_all.shape[0]:
+                        next_in_rl_phase = bool(
+                            rl_phase_all[t + 1, env_idx]
+                            .detach()
+                            .bool()
+                            .any()
+                            .item()
+                        )
+                    else:
+                        next_in_rl_phase = False
+                if not in_rl_phase:
+                    if env_done > 0.0:
+                        completed_episodes += 1
+                        if not auto_reset:
+                            break
+                    skipped_non_rl += 1
+                    continue
+                phase_done = rl_phase_all is not None and not next_in_rl_phase
+                done = float(env_done > 0.0 or phase_done)
                 intervention = 0.0
                 if intervention_flags_all is not None:
                     intervention = float(
@@ -356,10 +391,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     intervention=intervention,
                 )
                 added += 1
-                if done > 0.0:
-                    break
+                if env_done > 0.0:
+                    completed_episodes += 1
+                    if not auto_reset:
+                        break
 
-        return added
+        return added, skipped_non_rl, completed_episodes
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         clear_memory(sync=False)
@@ -370,22 +407,169 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
         for _ in range(split_num):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            self._trajectory_to_transitions(trajectory)
+            added, skipped_non_rl, completed_episodes = self._trajectory_to_transitions(
+                trajectory
+            )
+            self.transitions_since_train += added
+            self.non_rl_transitions_since_train += skipped_non_rl
+            self.episodes_since_train += completed_episodes
+            self.total_transitions_added += added
+            self.total_non_rl_transitions += skipped_non_rl
+            self.total_episodes_added += completed_episodes
+
+    def _global_rollout_counters(self) -> dict[str, float]:
+        return all_reduce_dict(
+            {
+                "transitions_since_train": float(self.transitions_since_train),
+                "non_rl_transitions_since_train": float(
+                    self.non_rl_transitions_since_train
+                ),
+                "episodes_since_train": float(self.episodes_since_train),
+                "total_transitions_added": float(self.total_transitions_added),
+                "total_non_rl_transitions": float(self.total_non_rl_transitions),
+                "total_episodes_added": float(self.total_episodes_added),
+            },
+            op=torch.distributed.ReduceOp.SUM,
+        )
+
+    def _global_min_replay_size(self) -> int:
+        replay_size = 0 if self.replay_buffer is None else len(self.replay_buffer)
+        reduced = all_reduce_dict(
+            {"min_replay_size": float(replay_size)},
+            op=torch.distributed.ReduceOp.MIN,
+        )
+        return int(reduced["min_replay_size"])
+
+    def _append_training_schedule_metrics(
+        self,
+        metrics: dict[str, Any],
+        *,
+        global_counters: dict[str, float],
+        global_min_replay_size: int,
+        warmup_min_size: int,
+        warmup_post_collect_updates: int,
+        update_epoch: int,
+        train_every_transitions: int,
+        train_every_episodes: int,
+        should_train: bool,
+        skip_reason: int,
+        critic_updates_run: int = 0,
+        actor_updates_run: int = 0,
+    ) -> None:
+        append_to_dict(
+            metrics,
+            {
+                "rlt_stage2/update_step": float(self.update_step),
+                "rlt_stage2/critic_updates_run": float(critic_updates_run),
+                "rlt_stage2/actor_updates_run": float(actor_updates_run),
+                "rlt_stage2/should_train": float(should_train),
+                "rlt_stage2/skip_reason": float(skip_reason),
+                "rlt_stage2/ready_for_online": float(
+                    self.update_step >= warmup_post_collect_updates
+                ),
+                "rlt_stage2/global_min_replay_size": float(global_min_replay_size),
+                "rlt_stage2/update_epoch": float(update_epoch),
+                "rlt_stage2/global_transitions_since_train": float(
+                    global_counters["transitions_since_train"]
+                ),
+                "rlt_stage2/global_total_transitions_added": float(
+                    global_counters["total_transitions_added"]
+                ),
+            },
+        )
+        total_seen = (
+            float(global_counters["transitions_since_train"])
+            + float(global_counters["non_rl_transitions_since_train"])
+        )
+        if total_seen > 0.0:
+            append_to_dict(
+                metrics,
+                {
+                    "rlt_stage2/rl_phase_transition_rate": float(
+                        global_counters["transitions_since_train"]
+                    )
+                    / total_seen
+                },
+            )
+
+    def _append_replay_stats(self, metrics: dict[str, Any]) -> None:
+        if self.replay_buffer is None:
+            return
+        stats = self.replay_buffer.get_stats()
+        for key, value in stats.items():
+            if key == "capacity":
+                continue
+            append_to_dict(metrics, {f"replay_buffer/{key}": value})
 
     @Worker.timer("run_training")
     def run_training(self):
         if self.replay_buffer is None:
             return {}
 
+        metrics: dict[str, Any] = {}
+        warmup_min_size = int(
+            self.cfg.algorithm.get(
+                "warmup_min_size",
+                self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1),
+            )
+        )
+        warmup_post_collect_updates = int(
+            self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+        )
+        update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        train_every_transitions = int(
+            self.cfg.algorithm.get("train_every_transitions", 0)
+        )
+        train_every_episodes = int(self.cfg.algorithm.get("train_every_episodes", 0))
+        global_counters = self._global_rollout_counters()
+        global_min_replay_size = self._global_min_replay_size()
+        cadence_configured = (
+            train_every_transitions > 0 or train_every_episodes > 0
+        )
+        transitions_ready = (
+            train_every_transitions > 0
+            and global_counters["transitions_since_train"] >= train_every_transitions
+        )
+        episodes_ready = (
+            train_every_episodes > 0
+            and global_counters["episodes_since_train"] >= train_every_episodes
+        )
+        cadence_ready = (
+            (not cadence_configured)
+            or transitions_ready
+            or episodes_ready
+        )
+        buffer_ready = global_min_replay_size >= warmup_min_size
+
+        skip_reason = 0
+        if update_epoch <= 0:
+            skip_reason = 3
+        elif not buffer_ready:
+            skip_reason = 1
+        elif not cadence_ready:
+            skip_reason = 2
+
+        if skip_reason != 0:
+            self._append_replay_stats(metrics)
+            self._append_training_schedule_metrics(
+                metrics,
+                global_counters=global_counters,
+                global_min_replay_size=global_min_replay_size,
+                warmup_min_size=warmup_min_size,
+                warmup_post_collect_updates=warmup_post_collect_updates,
+                update_epoch=update_epoch,
+                train_every_transitions=train_every_transitions,
+                train_every_episodes=train_every_episodes,
+                should_train=False,
+                skip_reason=skip_reason,
+            )
+            return self._process_train_metrics(metrics)
+
         if self.enable_offload:
             if self.is_weight_offloaded:
                 self.load_param_and_grad(self.device)
             if self.is_optimizer_offloaded:
                 self.load_optimizer(self.device)
-
-        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1)
-        if not self.replay_buffer.is_ready(min_buffer_size):
-            return {}
 
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
@@ -397,8 +581,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         self.gradient_accumulation = micro_batch_cnt
 
         self.model.train()
-        metrics = {}
-        update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        critic_updates_run = 0
+        actor_updates_run = 0
         for _ in range(update_epoch):
             batch = self.replay_buffer.sample(global_batch_size_per_rank, self.device)
             batch_dict = batch.to_dict()
@@ -407,27 +591,42 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 begin = i * self.cfg.actor.micro_batch_size
                 end = begin + self.cfg.actor.micro_batch_size
                 micro_batches.append({k: v[begin:end] for k, v in batch_dict.items()})
-            epoch_metrics = self._update_one_epoch(micro_batches)
+            epoch_metrics = self._update_one_epoch(
+                micro_batches,
+                global_min_replay_size=global_min_replay_size,
+            )
             append_to_dict(metrics, epoch_metrics)
             self.update_step += 1
+            critic_updates_run += 1
+            if "rlt_stage2/actor_loss" in epoch_metrics:
+                actor_updates_run += 1
 
-        stats = self.replay_buffer.get_stats()
-        for key, value in stats.items():
-            append_to_dict(metrics, {f"replay_buffer/{key}": value})
-        append_to_dict(
+        self._append_replay_stats(metrics)
+        self._append_training_schedule_metrics(
             metrics,
-            {
-                "rlt_stage2/actor_only_train_model": float(
-                    self.actor_only_train_model
-                ),
-                "rlt_stage2/rollout_sync_key_count": float(
-                    self._rollout_sync_key_count
-                ),
-            },
+            global_counters=global_counters,
+            global_min_replay_size=global_min_replay_size,
+            warmup_min_size=warmup_min_size,
+            warmup_post_collect_updates=warmup_post_collect_updates,
+            update_epoch=update_epoch,
+            train_every_transitions=train_every_transitions,
+            train_every_episodes=train_every_episodes,
+            should_train=True,
+            skip_reason=0,
+            critic_updates_run=critic_updates_run,
+            actor_updates_run=actor_updates_run,
         )
+        self.transitions_since_train = 0
+        self.non_rl_transitions_since_train = 0
+        self.episodes_since_train = 0
         return self._process_train_metrics(metrics)
 
-    def _update_one_epoch(self, micro_batches: list[dict[str, torch.Tensor]]) -> dict[str, float]:
+    def _update_one_epoch(
+        self,
+        micro_batches: list[dict[str, torch.Tensor]],
+        *,
+        global_min_replay_size: int,
+    ) -> dict[str, float]:
         stage2_cfg = self.cfg.actor.model.rlt_stage2
         critic_losses = []
         q1_values = []
@@ -475,27 +674,25 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
         }
 
-        min_buffer_size = int(
-            self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1)
+        warmup_min_size = int(
+            self.cfg.algorithm.get(
+                "warmup_min_size",
+                self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1),
+            )
         )
-        actor_warmup_steps = int(
-            self.cfg.algorithm.get("actor_warmup_steps", min_buffer_size)
-        )
-        actor_warmup_done = len(self.replay_buffer) >= actor_warmup_steps
+        replay_ready = global_min_replay_size >= warmup_min_size
         bc_weight, q_weight, delta_weight, in_loss_warmup, loss_ramp_progress = (
             self._resolve_actor_loss_weights()
         )
         update_actor = (
-            actor_warmup_done
+            replay_ready
             and (self.update_step + 1) % int(self.cfg.algorithm.critic_actor_ratio) == 0
         )
         if update_actor:
             actor_losses = []
             actor_q_values = []
             actor_residual_abs = []
-            actor_residual_l2 = []
             actor_bc_losses = []
-            actor_delta_losses = []
             self.optimizer.zero_grad()
             self.model.set_online_critic_requires_grad(False)
             for idx, batch in enumerate(micro_batches):
@@ -537,14 +734,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 actor_losses.append(loss.detach().float().item() * self.gradient_accumulation)
                 actor_q_values.append(q_value.detach().float().mean().item())
                 actor_residual_abs.append(residual.detach().float().abs().mean().item())
-                actor_residual_l2.append(
-                    residual.detach().float().pow(2).mean().sqrt().item()
-                )
                 actor_bc_losses.append(
                     float(actor_loss_metrics["bc_loss"].float().item())
-                )
-                actor_delta_losses.append(
-                    float(actor_loss_metrics["delta_loss"].float().item())
                 )
             self.model.set_online_critic_requires_grad(True)
 
@@ -562,27 +753,16 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/grad_norm": float(actor_grad_norm),
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/residual_abs_mean": float(np.mean(actor_residual_abs)),
-                    "actor/residual_l2": float(np.mean(actor_residual_l2)),
                     "actor/bc_weight": bc_weight,
                     "actor/q_weight": q_weight,
-                    "actor/delta_weight": delta_weight,
                     "actor/bc_loss": float(np.mean(actor_bc_losses)),
-                    "actor/delta_loss": float(np.mean(actor_delta_losses)),
-                    "actor/loss_warmup": float(in_loss_warmup),
-                    "actor/loss_ramp_progress": loss_ramp_progress,
                 }
             )
         else:
             metrics.update(
                 {
-                    "actor/update_skipped": 1.0,
-                    "actor/warmup_done": float(actor_warmup_done),
-                    "actor/warmup_steps": float(actor_warmup_steps),
                     "actor/bc_weight": bc_weight,
                     "actor/q_weight": q_weight,
-                    "actor/delta_weight": delta_weight,
-                    "actor/loss_warmup": float(in_loss_warmup),
-                    "actor/loss_ramp_progress": loss_ramp_progress,
                 }
             )
 
@@ -627,6 +807,12 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             {
                 "update_step": self.update_step,
                 "version": self.version,
+                "transitions_since_train": self.transitions_since_train,
+                "non_rl_transitions_since_train": self.non_rl_transitions_since_train,
+                "episodes_since_train": self.episodes_since_train,
+                "total_transitions_added": self.total_transitions_added,
+                "total_non_rl_transitions": self.total_non_rl_transitions,
+                "total_episodes_added": self.total_episodes_added,
                 "replay_buffer": self.replay_buffer.state_dict()
                 if self.replay_buffer is not None
                 else None,
@@ -654,6 +840,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             state = torch.load(stage2_load_path, map_location="cpu", weights_only=False)
             self.update_step = int(state.get("update_step", 0))
             self.version = int(state.get("version", self.update_step))
+            self.transitions_since_train = int(
+                state.get("transitions_since_train", 0)
+            )
+            self.non_rl_transitions_since_train = int(
+                state.get("non_rl_transitions_since_train", 0)
+            )
+            self.episodes_since_train = int(state.get("episodes_since_train", 0))
+            self.total_transitions_added = int(state.get("total_transitions_added", 0))
+            self.total_non_rl_transitions = int(
+                state.get("total_non_rl_transitions", 0)
+            )
+            self.total_episodes_added = int(state.get("total_episodes_added", 0))
             if self.replay_buffer is not None and state.get("replay_buffer") is not None:
                 self.replay_buffer.load_state_dict(state["replay_buffer"])
 

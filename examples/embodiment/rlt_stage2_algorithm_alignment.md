@@ -421,17 +421,22 @@ for N_warm environment steps:
 
 ### 本地实现
 
-本地目前主要是三层近似：
+本地 joint Stage2 配置现在主要是四层近似：
 
 | 配置 | 通俗解释 |
 | --- | --- |
-| `replay_buffer.min_buffer_size: 600` | buffer 少于 600 条 transition 时不训练 |
+| `train_every_episodes: 400` | 攒够约 400 个完成 episode 后触发一轮大训练 |
+| `train_every_transitions: 20000` | 如果 episode 结束慢，攒够 20000 条 chunk transition 也触发一轮大训练 |
+| `replay_buffer.min_buffer_size: 600` | 任一 actor rank 的 buffer 少于 600 条 transition 时不训练 |
 | `actor_warmup_steps: 600` | buffer 不够时不更新 actor |
 | `actor_warmup_updates: 200` | 前 200 个 actor/critic update 使用 warmup loss 权重 |
 
 相关 YAML：
 
 ```yaml
+update_epoch: 20000
+train_every_episodes: 400
+train_every_transitions: 20000
 actor_warmup_steps: 600
 actor_warmup_updates: 200
 actor_loss_ramp_updates: 400
@@ -441,7 +446,7 @@ replay_buffer:
 
 ### 为什么这么写
 
-这是为了在 RLinf 现有 runner 里少改 rollout 流程：先让 buffer 有数据，再逐步增强 RL 信号。
+这是为了在 RLinf 现有 runner 里少改 rollout 流程，同时避免“每次 90s rollout 只做 1 次 critic update”的低 update-to-data ratio：先让 buffer 有一批数据，再一次性做 20000 次 critic update 和约 10000 次 actor update。
 
 ### 对齐程度
 
@@ -500,8 +505,11 @@ RLinf 的 env/rollout 已经按 chunk 执行和收集 trajectory，本地实现�
 YAML：
 
 ```yaml
+update_epoch: 20000
 critic_updates_per_actor: 2
 critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
+train_every_episodes: 400
+train_every_transitions: 20000
 ```
 
 actor worker 中：
@@ -509,6 +517,7 @@ actor worker 中：
 ```text
 每次 update 都训练 critic。
 每隔 critic_actor_ratio 次才训练 actor。
+run_training() 只有在完成 episode 或 transition 数达到阈值后才真正执行 update_epoch 次更新。
 ```
 
 rollout 权重同步只同步 actor：
@@ -566,4 +575,3 @@ warmup 阶段是否真的执行了 a_tilde？
     action = actor(x, a_tilde)
     如果触发 intervention，则 action = a_expert，并且 a_tilde = a_expert
 ```
-

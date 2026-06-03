@@ -127,6 +127,17 @@ class MultiStepRolloutWorker(Worker):
         self.intervention_success_baseline = success_baseline
         self.intervention_last_success = last_success
 
+    def _rlt_stage2_online_update_gate(self) -> tuple[bool, int]:
+        warmup_required_updates = int(
+            self.cfg.algorithm.get("warmup_post_collect_updates", 0)
+        )
+        if warmup_required_updates < 0:
+            raise ValueError(
+                "algorithm.warmup_post_collect_updates must be >= 0, "
+                f"got {warmup_required_updates}."
+            )
+        return self.version >= warmup_required_updates, warmup_required_updates
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
@@ -322,6 +333,7 @@ class MultiStepRolloutWorker(Worker):
         mode: Literal["train", "eval"] = "train",
         *,
         allow_expert: bool = True,
+        policy_info: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -354,21 +366,144 @@ class MultiStepRolloutWorker(Worker):
             "only_save_expert", True
         )
         is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
+        local_rlt_policy_enabled = (
+            is_rlt_stage2_td3
+            and bool(self.cfg.algorithm.get("rlt_phase", {}).get("enable", False))
+        )
+        if local_rlt_policy_enabled and policy_info is None:
+            raise RuntimeError(
+                "RLT local phase control is enabled, but rollout received no "
+                "env policy_info. Refuse to fall back to global intervention; "
+                "check EnvWorker train bootstrap/interact policy_info plumbing."
+            )
+        use_local_rlt_policy = local_rlt_policy_enabled and policy_info is not None
+        if use_local_rlt_policy:
+            rl_phase = policy_info.get("rl_phase")
+            expert_takeover = policy_info.get("expert_takeover")
+            if rl_phase is None:
+                raise RuntimeError(
+                    "RLT local phase control is enabled but env policy_info is missing rl_phase."
+                )
+            rl_phase = rl_phase.to(self.device, dtype=torch.bool).reshape(-1)
+            if expert_takeover is None:
+                expert_takeover = torch.zeros_like(rl_phase)
+            else:
+                expert_takeover = expert_takeover.to(self.device, dtype=torch.bool).reshape(-1)
+            ready_for_online, online_gate_step = self._rlt_stage2_online_update_gate()
+            requested_expert_takeover = expert_takeover
+            expert_takeover = expert_takeover & ready_for_online & allow_expert
+        else:
+            rl_phase = None
+            expert_takeover = None
+            requested_expert_takeover = None
+            ready_for_online = True
+            online_gate_step = 0
 
         if (
             mode == "train"
             and allow_expert
             and self._has_expert_model_config
-            and (not is_rlt_stage2_td3 or self.intervention_enabled)
+            and (
+                (is_rlt_stage2_td3 and use_local_rlt_policy and expert_takeover.any())
+                or (not is_rlt_stage2_td3)
+                or (
+                    is_rlt_stage2_td3
+                    and (not local_rlt_policy_enabled)
+                    and self.intervention_enabled
+                )
+            )
         ):
-            use_expert = torch.rand(1).item() < self._dagger_sampling_params["beta"]
+            use_expert = (
+                bool(expert_takeover.any().item())
+                if use_local_rlt_policy
+                else torch.rand(1).item() < self._dagger_sampling_params["beta"]
+            )
         else:
             use_expert = False
 
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            if use_expert and is_rlt_stage2_td3:
+            if use_local_rlt_policy:
+                student_actions, result = self.hf_model.predict_action_batch(
+                    env_obs=env_obs,
+                    **kwargs,
+                )
+                forward_inputs = result["forward_inputs"]
+                base_flat = forward_inputs["a_tilde"].detach()
+                base_actions = base_flat.reshape(
+                    base_flat.shape[0],
+                    self.cfg.actor.model.num_action_chunks,
+                    self.cfg.actor.model.action_dim,
+                )
+                student_control = rl_phase & ready_for_online
+                actions = torch.where(
+                    student_control[:, None, None],
+                    student_actions,
+                    base_actions,
+                )
+                intervention_flags = torch.zeros(
+                    (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+                if use_expert:
+                    expert_model = self._ensure_expert_model_loaded()
+                    if getattr(expert_model, "act_as_vla_reference", False) and hasattr(
+                        expert_model, "predict_vla_reference_action_batch"
+                    ):
+                        expert_actions, _ = expert_model.predict_vla_reference_action_batch(
+                            env_obs=env_obs,
+                            **kwargs,
+                        )
+                    else:
+                        expert_actions, _ = expert_model.predict_action_batch(
+                            env_obs=env_obs,
+                            **kwargs,
+                        )
+                    expert_mask = expert_takeover[:, None, None].to(actions.device)
+                    actions = torch.where(expert_mask, expert_actions, actions)
+                    expert_flat = expert_actions.reshape(expert_actions.shape[0], -1)
+                    forward_inputs["a_tilde"] = torch.where(
+                        expert_takeover[:, None].to(base_flat.device),
+                        expert_flat.detach(),
+                        base_flat,
+                    )
+                    intervention_flags[expert_takeover] = True
+                    expert_label_flag = True
+
+                action_flat = actions.reshape(actions.shape[0], -1)
+                forward_inputs["base_a_tilde"] = base_flat
+                forward_inputs["action"] = action_flat.detach()
+                forward_inputs["rl_phase"] = rl_phase[:, None].to(actions.device)
+                forward_inputs["student_control"] = student_control[:, None].to(
+                    actions.device
+                )
+                forward_inputs["intervention_flags"] = intervention_flags
+                forward_inputs["intervention_requested"] = requested_expert_takeover[
+                    :, None
+                ].to(actions.device)
+                forward_inputs["ready_for_online"] = torch.full(
+                    (actions.shape[0], 1),
+                    ready_for_online,
+                    dtype=torch.bool,
+                    device=actions.device,
+                )
+                forward_inputs["online_gate_step"] = torch.full(
+                    (actions.shape[0], 1),
+                    float(online_gate_step),
+                    dtype=torch.float32,
+                    device=actions.device,
+                )
+                if "deviation" in policy_info:
+                    forward_inputs["deviation"] = policy_info["deviation"].to(
+                        actions.device, dtype=torch.bool
+                    )
+                if "takeover_left" in policy_info:
+                    forward_inputs["takeover_left"] = policy_info["takeover_left"].to(
+                        actions.device, dtype=torch.float32
+                    )
+            elif use_expert and is_rlt_stage2_td3:
                 _, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
@@ -448,6 +583,13 @@ class MultiStepRolloutWorker(Worker):
                     dtype=torch.bool,
                     device=actions.device,
                 )
+                if "rl_phase" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["rl_phase"] = torch.ones(
+                        (batch_size, 1),
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
                 if self.intervention_success_baseline is not None:
                     forward_inputs["intervention_success_baseline"] = torch.full(
                         (actions.shape[0], 1),
@@ -473,6 +615,8 @@ class MultiStepRolloutWorker(Worker):
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
         if final_obs is None:
+            return None
+        if self._is_rlt_stage2_td3():
             return None
         if not (
             hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head")
@@ -535,7 +679,10 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(env_output["obs"])
+                actions, result = self.predict(
+                    env_output["obs"],
+                    policy_info=env_output.get("policy_info", None),
+                )
 
                 save_flags = result.get("forward_inputs", {}).get(
                     "intervention_flags", None
@@ -572,6 +719,7 @@ class MultiStepRolloutWorker(Worker):
             actions, result = self.predict(
                 env_output["obs"],
                 allow_expert=False,
+                policy_info=env_output.get("policy_info", None),
             )
 
             forward_inputs = (
@@ -616,7 +764,12 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(env_output["obs"], mode="eval")
+                    actions, _ = self.predict(
+                        env_output["obs"],
+                        mode="eval",
+                        allow_expert=False,
+                        policy_info=env_output.get("policy_info", None),
+                    )
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
         if self.enable_offload:
@@ -711,6 +864,7 @@ class MultiStepRolloutWorker(Worker):
             for obs_batch in obs_batches
         ]
         final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+        policy_info_list = [obs_batch.get("policy_info", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -738,7 +892,45 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged_policy_info = None
+        if any(policy_info is not None for policy_info in policy_info_list):
+            batch_sizes = [
+                MultiStepRolloutWorker._infer_env_batch_size(obs_batch)
+                for obs_batch in obs_batches
+            ]
+            keys = set()
+            for policy_info in policy_info_list:
+                if policy_info is not None:
+                    keys.update(policy_info.keys())
+            merged_policy_info = {}
+            for key in keys:
+                ref_tensor = next(
+                    (
+                        policy_info[key]
+                        for policy_info in policy_info_list
+                        if policy_info is not None and key in policy_info
+                    ),
+                    None,
+                )
+                assert ref_tensor is not None
+                values = []
+                for batch_size, policy_info in zip(batch_sizes, policy_info_list):
+                    if policy_info is None or key not in policy_info:
+                        values.append(
+                            torch.zeros(
+                                (batch_size, *ref_tensor.shape[1:]),
+                                dtype=ref_tensor.dtype,
+                            )
+                        )
+                    else:
+                        values.append(policy_info[key])
+                merged_policy_info[key] = torch.cat(values, dim=0)
+
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "policy_info": merged_policy_info,
+        }
 
     def send_chunk_actions(
         self,

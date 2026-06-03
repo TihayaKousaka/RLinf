@@ -58,6 +58,7 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
+    policy_info: Optional[dict[str, torch.Tensor]] = None
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -90,6 +91,8 @@ class EnvOutput:
             if self.intervene_flags is not None
             else None
         )
+        if self.policy_info is not None:
+            self.policy_info = put_tensor_device(self.policy_info, "cpu")
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
         image_tensor = obs["main_images"] if "main_images" in obs else None
@@ -227,6 +230,37 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
+        policy_info_list = [env_output.get("policy_info") for env_output in env_outputs]
+        merged_policy_info = None
+        if any(policy_info is not None for policy_info in policy_info_list):
+            keys = set()
+            for policy_info in policy_info_list:
+                if policy_info is not None:
+                    keys.update(policy_info.keys())
+            merged_policy_info = {}
+            for key in keys:
+                values = []
+                ref_tensor = next(
+                    (
+                        policy_info[key]
+                        for policy_info in policy_info_list
+                        if policy_info is not None and key in policy_info
+                    ),
+                    None,
+                )
+                assert ref_tensor is not None
+                for env_output, policy_info in zip(env_outputs, policy_info_list):
+                    if policy_info is None or key not in policy_info:
+                        batch_size = _get_batch_size(env_output)
+                        values.append(
+                            torch.zeros(
+                                (batch_size, *ref_tensor.shape[1:]),
+                                dtype=ref_tensor.dtype,
+                            )
+                        )
+                    else:
+                        values.append(policy_info[key])
+                merged_policy_info[key] = torch.cat(values, dim=0)
         # turn to EnvOutput and turn to dict to call post init for tensor processing
         return EnvOutput(
             obs=merged_obs,
@@ -237,6 +271,7 @@ class EnvOutput:
             rewards=merged_rewards,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
+            policy_info=merged_policy_info,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -254,6 +289,7 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["policy_info"] = self.policy_info
 
         return env_output_dict
 

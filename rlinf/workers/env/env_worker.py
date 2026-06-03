@@ -56,6 +56,8 @@ class EnvWorker(Worker):
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
+        self.last_policy_info_list = []
+        self.eval_policy_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -138,11 +140,13 @@ class EnvWorker(Worker):
                 torch.zeros(self.train_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
+            self.rlt_local_policy_state: list[dict[str, torch.Tensor]] = []
         if self.enable_eval:
             self.eval_prev_done: list[torch.Tensor] = [
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
+            self.eval_rlt_local_policy_state: list[dict[str, torch.Tensor]] = []
 
     def init_worker(self):
         self.dst_rank_map = self._setup_dst_rank_map()
@@ -184,6 +188,10 @@ class EnvWorker(Worker):
                 f"max_steps_per_rollout_epoch="
                 f"{self.cfg.env.eval.max_steps_per_rollout_epoch}"
             )
+            self.eval_policy_info_list = [
+                self._init_rlt_local_policy_state(i, mode="eval")
+                for i in range(self.stage_num)
+            ]
 
         if not self.only_eval:
             self._init_env()
@@ -406,8 +414,290 @@ class EnvWorker(Worker):
                 extracted_obs, _ = self.env_list[i].reset()
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
+                self.last_policy_info_list.append(
+                    self._init_rlt_local_policy_state(i)
+                )
             if self.enable_offload and hasattr(self.env_list[i], "offload"):
                 self.env_list[i].offload()
+
+    def _rlt_stage2_local_intervention_enabled(self) -> bool:
+        return (
+            self.cfg.algorithm.get("loss_type", None) == "rlt_td3"
+            and self.cfg.actor.model.get("model_type", None) == "rlt_stage2"
+            and bool(self.cfg.algorithm.get("rlt_phase", {}).get("enable", False))
+        )
+
+    def _init_rlt_local_policy_state(
+        self, stage_id: int, mode: Literal["train", "eval"] = "train"
+    ) -> dict[str, torch.Tensor] | None:
+        if not self._rlt_stage2_local_intervention_enabled():
+            return None
+
+        batch_size = (
+            self.train_num_envs_per_stage
+            if mode == "train"
+            else self.eval_num_envs_per_stage
+        )
+        state = {
+            "rl_phase": torch.zeros(batch_size, dtype=torch.bool),
+            "expert_takeover": torch.zeros(batch_size, dtype=torch.bool),
+            "deviation": torch.zeros(batch_size, dtype=torch.bool),
+            "deviation_count": torch.zeros(batch_size, dtype=torch.int64),
+            "takeover_left": torch.zeros(batch_size, dtype=torch.int64),
+            "takeover_used": torch.zeros(batch_size, dtype=torch.int64),
+            "prev_yz_error": torch.full((batch_size,), float("nan"), dtype=torch.float32),
+            "prev_hole_x": torch.full((batch_size,), float("nan"), dtype=torch.float32),
+            "rl_phase_entry": torch.zeros(batch_size, dtype=torch.bool),
+        }
+        states = (
+            self.rlt_local_policy_state
+            if mode == "train"
+            else self.eval_rlt_local_policy_state
+        )
+        while len(states) <= stage_id:
+            states.append({})
+        states[stage_id] = state
+        return self._export_rlt_local_policy_info(state)
+
+    @staticmethod
+    def _export_rlt_local_policy_info(
+        state: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "rl_phase": state["rl_phase"][:, None],
+            "expert_takeover": state["expert_takeover"][:, None],
+            "deviation": state["deviation"][:, None],
+            "deviation_count": state["deviation_count"].to(torch.float32)[:, None],
+            "takeover_left": state["takeover_left"].to(torch.float32)[:, None],
+            "takeover_used": state["takeover_used"].to(torch.float32)[:, None],
+            "rl_phase_entry": state["rl_phase_entry"][:, None],
+        }
+
+    @staticmethod
+    def _select_rlt_policy_source_info(
+        infos: dict[str, Any],
+        required_keys: list[str],
+    ) -> dict[str, Any]:
+        if all(key in infos for key in required_keys):
+            return infos
+        final_info = infos.get("final_info")
+        if isinstance(final_info, dict) and all(
+            key in final_info for key in required_keys
+        ):
+            return final_info
+        missing = [key for key in required_keys if key not in infos]
+        raise RuntimeError(
+            "RLT local phase control is enabled, but ManiSkill info is missing "
+            f"required keys {missing}. This usually means the env wrapper is not "
+            "using the aligned peg-insertion info path."
+        )
+
+    @staticmethod
+    def _unwrap_env(env: Any) -> Any:
+        while hasattr(env, "env"):
+            env = env.env
+        return getattr(env, "unwrapped", env)
+
+    def _update_rlt_local_policy_state(
+        self,
+        infos: dict[str, Any] | None,
+        chunk_dones: torch.Tensor,
+        stage_id: int,
+        mode: Literal["train", "eval"] = "train",
+    ) -> dict[str, torch.Tensor] | None:
+        states = (
+            self.rlt_local_policy_state
+            if mode == "train"
+            else self.eval_rlt_local_policy_state
+        )
+        if (
+            not self._rlt_stage2_local_intervention_enabled()
+            or infos is None
+            or not states
+        ):
+            return None
+
+        required_keys = [
+            "consecutive_grasp_current",
+            "prealigned_current",
+            "partial_insert_current",
+            "success_current",
+            "peg_head_goal_yz_dist",
+            "peg_body_goal_yz_dist",
+            "peg_head_hole_x",
+            "peg_head_hole_abs_y",
+            "peg_head_hole_abs_z",
+        ]
+        infos = self._select_rlt_policy_source_info(infos, required_keys)
+
+        cfg = self.cfg.algorithm.get("rlt_phase", {})
+        intervention_cfg = self.cfg.algorithm.get("intervention", {})
+        state = states[stage_id]
+        device = infos["peg_head_hole_x"].device
+        for key, value in state.items():
+            state[key] = value.to(device)
+
+        done_any = chunk_dones.any(dim=1).to(device)
+
+        success = infos["success_current"].to(torch.bool)
+        grasp = infos["consecutive_grasp_current"].to(torch.bool)
+        prealigned = infos["prealigned_current"].to(torch.bool)
+        partial_insert = infos["partial_insert_current"].to(torch.bool)
+        yz_error = torch.maximum(
+            infos["peg_head_goal_yz_dist"].to(torch.float32),
+            infos["peg_body_goal_yz_dist"].to(torch.float32),
+        )
+        hole_x = infos["peg_head_hole_x"].to(torch.float32)
+        abs_y = infos["peg_head_hole_abs_y"].to(torch.float32)
+        abs_z = infos["peg_head_hole_abs_z"].to(torch.float32)
+
+        hole_radii = None
+        env_list = self.env_list if mode == "train" else self.eval_env_list
+        unwrapped = self._unwrap_env(env_list[stage_id])
+        if hasattr(unwrapped, "box_hole_radii"):
+            hole_radii = unwrapped.box_hole_radii.to(device, dtype=torch.float32)
+        if hole_radii is None:
+            hole_radii = torch.full_like(abs_y, float(cfg.get("fallback_hole_radius", 0.035)))
+
+        progress_eps = float(intervention_cfg.get("progress_eps", 0.002))
+        yz_error_eps = float(intervention_cfg.get("yz_error_eps", 0.002))
+        safe_yz_margin = float(intervention_cfg.get("safe_yz_margin", 1.25))
+        intervention_near_hole_x_min = float(
+            intervention_cfg.get("near_hole_x_min", -0.05)
+        )
+        phase_near_hole_x_min = float(
+            cfg.get("near_hole_x_min", intervention_near_hole_x_min)
+        )
+        phase_exit_hole_x_min = float(cfg.get("exit_hole_x_min", -0.12))
+        phase_yz_margin = float(cfg.get("near_hole_yz_margin", 1.5))
+
+        phase_yz = (
+            (yz_error <= phase_yz_margin * hole_radii)
+            & (abs_y <= phase_yz_margin * hole_radii)
+            & (abs_z <= phase_yz_margin * hole_radii)
+        ) | prealigned | partial_insert
+        phase_near_hole = hole_x >= phase_near_hole_x_min
+        phase_entry = grasp & phase_near_hole & phase_yz & (~success)
+        phase_hold = state["rl_phase"] & (~success) & (hole_x >= phase_exit_hole_x_min)
+        rl_phase = phase_entry | phase_hold
+
+        has_prev_yz = torch.isfinite(state["prev_yz_error"])
+        has_prev_x = torch.isfinite(state["prev_hole_x"])
+        yz_worse = has_prev_yz & (yz_error > state["prev_yz_error"] + yz_error_eps)
+        no_x_progress = has_prev_x & (hole_x <= state["prev_hole_x"] + progress_eps)
+        safe_yz = (abs_y <= safe_yz_margin * hole_radii) & (
+            abs_z <= safe_yz_margin * hole_radii
+        )
+        intervention_near_hole = hole_x >= intervention_near_hole_x_min
+        moved_away_from_hole = (
+            has_prev_x
+            & state["rl_phase"]
+            & (hole_x < state["prev_hole_x"] - progress_eps)
+        )
+        lost_grasp = (~grasp) & state["rl_phase"]
+        deviation = rl_phase & (
+            yz_worse
+            | no_x_progress
+            | (intervention_near_hole & (~safe_yz))
+            | lost_grasp
+            | moved_away_from_hole
+        )
+
+        patience = int(intervention_cfg.get("deviation_patience", 2))
+        state["deviation_count"] = torch.where(
+            deviation,
+            state["deviation_count"] + 1,
+            torch.zeros_like(state["deviation_count"]),
+        )
+
+        takeover_chunks = int(intervention_cfg.get("takeover_chunks", 5))
+        takeover_max_chunks = int(intervention_cfg.get("takeover_max_chunks", 10))
+        if takeover_chunks <= 0 or takeover_max_chunks < takeover_chunks:
+            raise ValueError(
+                "algorithm.intervention must satisfy "
+                "0 < takeover_chunks <= takeover_max_chunks, got "
+                f"{takeover_chunks=} and {takeover_max_chunks=}."
+            )
+
+        previous_takeover = state["expert_takeover"]
+        takeover_used_after_chunk = torch.where(
+            previous_takeover,
+            state["takeover_used"] + 1,
+            state["takeover_used"],
+        )
+        recovered = rl_phase & grasp & safe_yz & (~deviation)
+        keep_for_min_chunks = previous_takeover & (
+            takeover_used_after_chunk < takeover_chunks
+        )
+        extend_until_recovered = (
+            previous_takeover
+            & (~recovered)
+            & (takeover_used_after_chunk < takeover_max_chunks)
+        )
+        if mode == "train" and bool(intervention_cfg.get("enable", True)):
+            trigger = (
+                rl_phase
+                & (~previous_takeover)
+                & (state["deviation_count"] >= patience)
+            )
+        else:
+            trigger = torch.zeros_like(rl_phase)
+        next_takeover = (trigger | keep_for_min_chunks | extend_until_recovered) & (
+            ~success
+        )
+        next_takeover = torch.where(
+            done_any, torch.zeros_like(next_takeover), next_takeover
+        )
+        released_takeover = previous_takeover & (~next_takeover)
+
+        state["takeover_used"] = torch.where(
+            trigger,
+            torch.zeros_like(state["takeover_used"]),
+            takeover_used_after_chunk,
+        )
+        state["takeover_used"] = torch.where(
+            next_takeover,
+            state["takeover_used"],
+            torch.zeros_like(state["takeover_left"]),
+        )
+        remaining_to_min = torch.clamp(takeover_chunks - state["takeover_used"], min=0)
+        remaining_to_max = torch.clamp(
+            takeover_max_chunks - state["takeover_used"], min=0
+        )
+        state["takeover_left"] = torch.where(
+            next_takeover,
+            torch.where(
+                state["takeover_used"] < takeover_chunks,
+                remaining_to_min,
+                remaining_to_max,
+            ),
+            torch.zeros_like(state["takeover_used"]),
+        )
+        state["expert_takeover"] = next_takeover
+        state["rl_phase"] = torch.where(done_any, torch.zeros_like(rl_phase), rl_phase)
+        state["deviation"] = torch.where(
+            done_any, torch.zeros_like(deviation), deviation
+        )
+        state["deviation_count"] = torch.where(
+            done_any | (~rl_phase) | trigger | released_takeover,
+            torch.zeros_like(state["deviation_count"]),
+            state["deviation_count"],
+        )
+        state["rl_phase_entry"] = torch.where(
+            done_any, torch.zeros_like(phase_entry), phase_entry & (~phase_hold)
+        )
+        state["prev_yz_error"] = torch.where(
+            state["rl_phase"],
+            yz_error,
+            torch.full_like(yz_error, float("nan")),
+        )
+        state["prev_hole_x"] = torch.where(
+            state["rl_phase"],
+            hole_x,
+            torch.full_like(hole_x, float("nan")),
+        )
+
+        return self._export_rlt_local_policy_info(state)
 
     @staticmethod
     def _shape_str(value) -> str:
@@ -509,6 +799,11 @@ class EnvWorker(Worker):
                 intervene_actions = final_info["intervene_action"]
                 intervene_flags = final_info["intervene_flag"]
 
+        policy_info = self._update_rlt_local_policy_state(infos, chunk_dones, stage_id)
+        if policy_info is not None:
+            env_info["rl_phase_rate"] = policy_info["rl_phase"].float().mean().reshape(1).cpu()
+            env_info["deviation_rate"] = policy_info["deviation"].float().mean().reshape(1).cpu()
+
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
@@ -518,6 +813,7 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            policy_info=policy_info,
         )
         return env_output, env_info
 
@@ -581,9 +877,25 @@ class EnvWorker(Worker):
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 
+        policy_info = self._update_rlt_local_policy_state(
+            infos, chunk_dones, stage_id, mode="eval"
+        )
+        if policy_info is not None:
+            policy_info["expert_takeover"] = torch.zeros_like(
+                policy_info["expert_takeover"]
+            )
+            self.eval_policy_info_list[stage_id] = policy_info
+            env_info["rl_phase_rate"] = (
+                policy_info["rl_phase"].float().mean().reshape(1).cpu()
+            )
+            env_info["deviation_rate"] = (
+                policy_info["deviation"].float().mean().reshape(1).cpu()
+            )
+
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            policy_info=policy_info,
         )
         return env_output, env_info
 
@@ -938,6 +1250,7 @@ class EnvWorker(Worker):
                     ),
                     intervene_actions=None,
                     intervene_flags=None,
+                    policy_info=self._init_rlt_local_policy_state(stage_id),
                 )
                 env_outputs.append(env_output)
         else:
@@ -954,6 +1267,7 @@ class EnvWorker(Worker):
                     truncations=truncations,
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    policy_info=self.last_policy_info_list[stage_id],
                 )
                 env_outputs.append(env_output)
 
@@ -970,6 +1284,7 @@ class EnvWorker(Worker):
                 {
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
+                    "policy_info": env_batch["policy_info"],
                 },
             )
 
@@ -1009,6 +1324,9 @@ class EnvWorker(Worker):
         self.last_intervened_info_list = [
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
+        ]
+        self.last_policy_info_list = [
+            env_output.policy_info for env_output in env_output_list
         ]
 
     async def send_rollout_trajectories(
@@ -1076,6 +1394,34 @@ class EnvWorker(Worker):
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
                     )
+                    intervention_flags = rollout_result.forward_inputs.get(
+                        "intervention_flags", None
+                    )
+                    if intervention_flags is not None:
+                        env_metrics["expert_intervention_actual_rate"].append(
+                            intervention_flags.detach().float().reshape(-1).cpu()
+                        )
+                    intervention_requested = rollout_result.forward_inputs.get(
+                        "intervention_requested", None
+                    )
+                    if intervention_requested is not None:
+                        env_metrics["expert_intervention_requested_rate"].append(
+                            intervention_requested.detach().float().reshape(-1).cpu()
+                        )
+                    ready_for_online = rollout_result.forward_inputs.get(
+                        "ready_for_online", None
+                    )
+                    if ready_for_online is not None:
+                        env_metrics["rlt_ready_for_online"].append(
+                            ready_for_online.detach().float().reshape(-1).cpu()
+                        )
+                    student_control = rollout_result.forward_inputs.get(
+                        "student_control", None
+                    )
+                    if student_control is not None:
+                        env_metrics["student_control_rate"].append(
+                            student_control.detach().float().reshape(-1).cpu()
+                        )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
@@ -1113,6 +1459,7 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "policy_info": env_batch["policy_info"],
                         },
                     )
                     if self.collect_transitions:
@@ -1223,6 +1570,10 @@ class EnvWorker(Worker):
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    policy_info = self._init_rlt_local_policy_state(
+                        stage_id, mode="eval"
+                    )
+                    self.eval_policy_info_list[stage_id] = policy_info
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1230,6 +1581,7 @@ class EnvWorker(Worker):
                             if "final_observation" in infos
                             else None
                         ),
+                        policy_info=policy_info,
                     )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
@@ -1237,6 +1589,7 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "policy_info": env_batch["policy_info"],
                         },
                         mode="eval",
                     )
@@ -1269,6 +1622,7 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "policy_info": env_batch["policy_info"],
                         },
                         mode="eval",
                     )

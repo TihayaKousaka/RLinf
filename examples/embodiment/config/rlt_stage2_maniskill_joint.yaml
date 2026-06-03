@@ -34,9 +34,9 @@ runner:
   max_epochs: 5000
   max_steps: -1
   only_eval: False
-  # 每隔多少个 global step 把 actor 权重同步到 rollout worker。
-  # 太大则 rollout 用旧 actor；太小则通信开销更高。
-  weight_sync_interval: 10
+  # Stage2 现在按大批量 TD3 update 训练；每个 runner step 同步一次小 actor，
+  # 确保一次 20k/10k 更新后的下一轮 rollout 立即使用新权重。
+  weight_sync_interval: 1
   # Eval/保存间隔，单位是 runner global step。
   val_check_interval: 50
   save_interval: 50
@@ -44,8 +44,21 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # 每次 actor.run_training() 内部采样并更新几轮。
-  update_epoch: 1
+  # 攒够一批 rollout 后，每次 actor.run_training() 跑 2000 次 critic update。
+  # actor 按 critic_actor_ratio=2 更新，所以对应约 1000 次 actor update。
+  update_epoch: 2000
+  # Openpi-RLT 风格 warmup：先用 base VLA 收 RL-phase replay；
+  # 达到 warmup_min_size 后 learner 才开始 TD3 warmup update。
+  # 单位：RL-phase action-chunk transition，不是 episode/global step。
+  warmup_min_size: 600
+  # Learner 至少完成这些 critic update 后，rollout/eval 才允许 Stage2 actor
+  # 在 RL phase 接管；之前 RL phase 也继续执行 base VLA。
+  # 单位：critic update。对齐 openpi-RLT 可设 20000，仿真先用 10000 减少等待。
+  warmup_post_collect_updates: 10000
+  # Online 后按新增 RL-phase transition 触发批量 TD3 update；
+  # 设 0 表示不按 episode 触发，避免 episode 数和局部 RL-phase replay 混用。
+  train_every_episodes: 0
+  train_every_transitions: 2000
   group_size: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -61,36 +74,39 @@ algorithm:
   tau: 0.005
   # 每几个 critic update 更新一次 actor；当前为 2:1 TD3 风格。
   critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
-  # Replay buffer 至少达到这个 transition 数后，才允许 actor 更新。
-  # 这里是 transition 数，不是 global step；设高一点让 critic 先稳定，避免 actor 早期偏离 base VLA。
-  actor_warmup_steps: 20000
-  # 前 200 个 training update 使用 warmup loss 权重。
-  actor_warmup_updates: 200
-  # warmup 后再用 400 个 update 从 warmup 权重线性过渡到 online 权重。
-  actor_loss_ramp_updates: 400
+  # Actor loss 权重 schedule 是训练稳定项，不是论文的 Nwarm。
+  # 单位：critic update。
+  actor_loss_warmup_updates: 0
+  actor_loss_ramp_updates: 0
   target_update_freq: 1
-  intervention:
-    # Expert intervention：用强 VLA 模拟人在环接管。
+  rlt_phase:
+    # Stage2 只接管 peg 插入关键段；其余阶段执行 base VLA reference。
     enable: True
-    # 用 train env 的 success_once 判断是否需要接管；该指标有噪声。
-    success_metric: "env/success_once"
-    # 前 10 个 rollout 估计 baseline；当前取这段里的最小值作为 baseline。
-    baseline_warmup_steps: 10
-    # 低于 baseline * (1 - 0.20) = baseline * 0.8 才认为崩。
-    relative_drop: 0.20
-    # 连续 3 个 rollout 低于阈值才触发 expert，避免单步噪声误触发。
-    trigger_patience: 3
-    # 触发后连续 3 个 rollout 开 expert，避免 0/1 尖峰式抖动。
-    intervention_rollouts: 3
-    # 触发 intervention 时完整使用 expert；设小于 1 会混入学生动作。
-    probability: 1.0
+    # 进入 RL phase：peg 已抓稳、peg head 接近孔口，且 y/z 仍在孔半径附近。
+    near_hole_x_min: -0.05
+    near_hole_yz_margin: 1.5
+    # 已经进入 RL phase 后，允许短暂偏离；退到这个 x 之外则交还 base VLA。
+    exit_hole_x_min: -0.12
+    fallback_hole_radius: 0.035
+  intervention:
+    # Expert intervention：按论文语义做局部纠偏，而不是固定概率常开。
+    enable: True
+    mode: local_correction
+    # Expert 只在 ready_for_online 后才可能介入；warmup 阶段强制关闭。
+    deviation_patience: 3
+    takeover_chunks: 3
+    takeover_max_chunks: 5
+    safe_yz_margin: 2.0
+    progress_eps: 0.01
+    yz_error_eps: 0.01
+    near_hole_x_min: -0.02
   replay_buffer:
     # 这几个 cache/window 字段是 RLinf 通用 replay 配置；
     # 当前 RLTStage2ReplayBuffer 主要使用 min_buffer_size。
     enable_cache: True
     cache_size: 10000
     sample_window_size: 10000
-    # buffer 少于 600 条 transition 时不训练。
+    # Stage2 训练门槛由 algorithm.warmup_min_size 控制；这里保留兼容字段。
     min_buffer_size: 600
     auto_save: False
   sampling_params:
