@@ -44,19 +44,20 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # 攒够一批 rollout 后，每次 actor.run_training() 跑 2000 次 critic update。
-  # actor 按 critic_actor_ratio=2 更新，所以对应约 1000 次 actor update。
+  # 每次触发 Stage2 训练时，learner 连续做多少次 critic update。
+  # critic_actor_ratio=2 时，2000 次 critic update 约对应 1000 次 actor update。
   update_epoch: 2000
-  # Openpi-RLT 风格 warmup：先用 base VLA 收 RL-phase replay；
-  # 达到 warmup_min_size 后 learner 才开始 TD3 warmup update。
-  # 单位：RL-phase action-chunk transition，不是 episode/global step。
+  # Replay 最少攒多少条 action-chunk transition 后才开始训练。
+  # 这里的 1 条 transition 是 1 个 10-step action chunk，不是 1 个 env step，
+  # 也不是 1 个 episode；rlt_phase.enable=False 时整条任务的 chunk 都会进入 replay。
   warmup_min_size: 600
-  # Learner 至少完成这些 critic update 后，rollout/eval 才允许 Stage2 actor
-  # 在 RL phase 接管；之前 RL phase 也继续执行 base VLA。
-  # 单位：critic update。对齐 openpi-RLT 可设 20000，仿真先用 10000 减少等待。
+  # Stage2 actor 上线前，learner 至少要完成多少次 critic update。
+  # 达到这个数之前：train/eval 都执行 base VLA，但 actor/critic 可以后台训练。
+  # 达到这个数之后：train/eval 才执行 Stage2 actor 的动作。
+  # 单位是 critic update；openpi-RLT 常用 20000，这里先用 10000 做仿真调试。
   warmup_post_collect_updates: 10000
-  # Online 后按新增 RL-phase transition 触发批量 TD3 update；
-  # 设 0 表示不按 episode 触发，避免 episode 数和局部 RL-phase replay 混用。
+  # 每新增多少条 full-task chunk transition 触发一次训练。
+  # 设 0 表示不按 episode 触发；当前只按 transition 数触发，便于和 replay 对齐。
   train_every_episodes: 0
   train_every_transitions: 2000
   group_size: 1
@@ -72,41 +73,58 @@ algorithm:
   # TD target 折扣因子和 target critic 软更新系数。
   gamma: 0.99
   tau: 0.005
-  # 每几个 critic update 更新一次 actor；当前为 2:1 TD3 风格。
+  # 每几个 critic update 更新一次 actor；2 表示 2 critic : 1 actor。
   critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
-  # Actor loss 权重 schedule 是训练稳定项，不是论文的 Nwarm。
-  # 单位：critic update。
+  # Actor loss 权重 schedule 是额外稳定项，不是 openpi-RLT 的 data warmup。
+  # 当前设为 0，表示 actor loss 从一开始就使用 online_bc/q 权重。
   actor_loss_warmup_updates: 0
   actor_loss_ramp_updates: 0
   target_update_freq: 1
   rlt_phase:
-    # Stage2 只接管 peg 插入关键段；其余阶段执行 base VLA reference。
-    enable: True
-    # 进入 RL phase：peg 已抓稳、peg head 接近孔口，且 y/z 仍在孔半径附近。
+    # rlt_phase 只管“哪些 chunk 走 Stage2/control/replay”，不管 expert 接管。
+    # enable=False：完全不使用本块阈值，Stage2 默认 full-task，整条任务都进 replay/control。
+    # 这不是关闭 Stage2；Stage2 由 loss_type=rlt_td3 + model_type=rlt_stage2 决定。
+    # enable=True：启用局部 phase，只在接近孔口、抓稳且未成功时让 Stage2 接管。
+    enable: False
+    # 以下参数只在 enable=True 时生效；enable=False 时全部忽略。
     near_hole_x_min: -0.05
     near_hole_yz_margin: 1.5
-    # 已经进入 RL phase 后，允许短暂偏离；退到这个 x 之外则交还 base VLA。
     exit_hole_x_min: -0.12
     fallback_hole_radius: 0.035
   intervention:
-    # Expert intervention：按论文语义做局部纠偏，而不是固定概率常开。
+    # intervention 独立于 rlt_phase：无论 full-task 还是局部 phase，都可启用 expert/human 纠偏。
+    # enable=True：允许 env 根据下面的偏离检测请求 expert 接管。
+    # warmup 阶段仍强制不执行 expert；只有 ready_for_online=True 后才会真的接管。
     enable: True
     mode: local_correction
-    # Expert 只在 ready_for_online 后才可能介入；warmup 阶段强制关闭。
+    # local_correction：连续检测到偏离后，请 expert 接管若干个 action chunk。
+    # deviation_patience 单位是 action chunk，3 表示连续 3 个 10-step chunk 偏离才触发。
     deviation_patience: 3
+    # 触发后至少接管多少个 action chunk；一个 chunk = 10 个 env control step。
     takeover_chunks: 3
+    # 如果还没恢复安全状态，最多连续接管多少个 action chunk。
     takeover_max_chunks: 5
+    # y/z 安全范围倍数，乘以当前 widened hole radius；越大越宽松、expert 越少介入。
     safe_yz_margin: 2.0
+    # x 插入进展阈值，单位 m/chunk；小于该进展视为没有向孔内推进。
     progress_eps: 0.01
+    # y/z 误差恶化阈值，单位 m/chunk；超过该增量视为对孔变差。
     yz_error_eps: 0.01
+    # expert 偏离检测开始的 x 门槛，单位 m，相对孔口坐标。
     near_hole_x_min: -0.02
+    # expert 可纠偏区的 y/z 半径倍数；只影响 expert，不影响 Stage2 replay/control。
+    near_hole_yz_margin: 1.5
+    # 已进入 expert 可纠偏区后，x 退到该阈值外就退出局部偏离检测。
+    exit_hole_x_min: -0.12
+    # 如果 env 没暴露 widened hole 半径，用这个半径做 expert 偏离检测，单位 m。
+    fallback_hole_radius: 0.035
   replay_buffer:
-    # 这几个 cache/window 字段是 RLinf 通用 replay 配置；
-    # 当前 RLTStage2ReplayBuffer 主要使用 min_buffer_size。
+    # 这几个 cache/window 字段是 RLinf 通用 replay 配置。
+    # Stage2 自定义 replay 的训练门槛实际由 algorithm.warmup_min_size 控制。
     enable_cache: True
     cache_size: 10000
     sample_window_size: 10000
-    # Stage2 训练门槛由 algorithm.warmup_min_size 控制；这里保留兼容字段。
+    # 兼容字段；保持和 warmup_min_size 一致，避免旧路径误读。
     min_buffer_size: 600
     auto_save: False
   sampling_params:
@@ -241,27 +259,31 @@ actor:
       # residual actor 和 twin-Q critic 的 MLP 宽度/层数。
       mlp_hidden_dim: 256
       mlp_num_hidden_layers: 2
-      # train rollout actor action noise；越大探索越强，也越容易偏离 base VLA。
+      # Online rollout 时给 Stage2 actor 动作加的探索噪声。
+      # 越大探索越强，也越容易破坏 base VLA 已经会做的动作。
       actor_noise_sigma: 0.002
-      # 训练 actor 时随机把一部分 a_tilde 输入置零，防止只复制 reference。
+      # 训练 actor 时随机把一部分 a_tilde 输入置零。
+      # 作用是逼 actor 也利用 RL token/state，不要只学复制 base VLA reference。
       ref_action_dropout: 0.5
-      # TD3 target policy smoothing 噪声。
+      # TD3 target policy smoothing：算 critic target 时给 next action 加小噪声。
+      # sigma 是噪声标准差，clip 是噪声最大绝对值。
       target_noise_sigma: 0.05
       target_noise_clip: 0.1
-      # 论文中的 BC regularizer beta 默认值；实际当前用 warmup/online 权重覆盖。
+      # BC regularizer 的默认权重；如果没有显式 warmup/online 权重会用它。
       bc_regularizer_beta: 5.0
-      # warmup 阶段：高 BC、低 Q，防止 actor 早期被不准的 critic 拉偏。
+      # actor_loss_warmup_updates > 0 时使用：高 BC、低 Q，防止早期 critic 拉偏 actor。
       warmup_bc_weight: 7.0
       warmup_q_weight: 0.05
-      # online 阶段：降低 BC、提高 Q，让 actor 有空间改进 base VLA。
+      # 当前实际使用的 actor loss 权重：
+      # actor_loss = online_bc_weight * BC_loss - online_q_weight * Q + delta_weight * delta_loss。
       online_bc_weight: 3.0
       online_q_weight: 0.1
-      # chunk 内动作差分正则；当前关掉。
+      # chunk 内动作差分正则；0 表示不启用。
       delta_weight: 0.0
       # TD3 常用设置：2 次 critic update 对 1 次 actor update。
       critic_updates_per_actor: 2
-      # Stage2 自定义 numpy replay buffer 容量；只存 x/action/reward，不存图像。
-      # 缩小容量能提高近期 rollout 和 expert intervention 样本占比。
+      # Stage2 自定义 numpy replay buffer 容量；只存 x/action/reward/a_tilde，不存图像。
+      # 满了会循环覆盖旧数据；容量越小，近期数据占比越高。
       buffer_capacity: 50000
       tau: 0.005
       gamma: 0.99

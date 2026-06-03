@@ -100,7 +100,10 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
-        self.intervention_enabled = False
+        intervention_cfg = self.cfg.algorithm.get("intervention", {})
+        self.intervention_enabled = bool(intervention_cfg.get("enable", False)) and (
+            intervention_cfg.get("mode", None) == "local_correction"
+        )
         self.intervention_success_baseline = None
         self.intervention_last_success = None
 
@@ -366,18 +369,40 @@ class MultiStepRolloutWorker(Worker):
             "only_save_expert", True
         )
         is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
-        local_rlt_policy_enabled = (
-            is_rlt_stage2_td3
-            and bool(self.cfg.algorithm.get("rlt_phase", {}).get("enable", False))
-        )
+        rlt_phase_cfg = self.cfg.algorithm.get("rlt_phase", {})
+        local_phase_enabled = bool(rlt_phase_cfg.get("enable", False))
+        local_rlt_policy_enabled = is_rlt_stage2_td3 and local_phase_enabled
+        full_task_rlt_policy_enabled = is_rlt_stage2_td3 and not local_phase_enabled
         if local_rlt_policy_enabled and policy_info is None:
             raise RuntimeError(
                 "RLT local phase control is enabled, but rollout received no "
-                "env policy_info. Refuse to fall back to global intervention; "
+                "env policy_info. Refuse to run with ambiguous phase state; "
                 "check EnvWorker train bootstrap/interact policy_info plumbing."
             )
-        use_local_rlt_policy = local_rlt_policy_enabled and policy_info is not None
-        if use_local_rlt_policy:
+        rlt_policy_gate_enabled = is_rlt_stage2_td3
+        if rlt_policy_gate_enabled:
+            ready_for_online, online_gate_step = self._rlt_stage2_online_update_gate()
+        else:
+            ready_for_online = True
+            online_gate_step = 0
+
+        if full_task_rlt_policy_enabled:
+            rl_phase = None
+            expert_takeover = None
+            if policy_info is not None:
+                rl_phase = policy_info.get("rl_phase")
+                if rl_phase is not None:
+                    rl_phase = rl_phase.to(self.device, dtype=torch.bool).reshape(-1)
+                expert_takeover = policy_info.get("expert_takeover")
+                if expert_takeover is not None:
+                    expert_takeover = expert_takeover.to(
+                        self.device, dtype=torch.bool
+                    ).reshape(-1)
+            requested_expert_takeover = None
+            if expert_takeover is not None:
+                requested_expert_takeover = expert_takeover
+                expert_takeover = expert_takeover & ready_for_online & allow_expert
+        elif local_rlt_policy_enabled and policy_info is not None:
             rl_phase = policy_info.get("rl_phase")
             expert_takeover = policy_info.get("expert_takeover")
             if rl_phase is None:
@@ -389,33 +414,35 @@ class MultiStepRolloutWorker(Worker):
                 expert_takeover = torch.zeros_like(rl_phase)
             else:
                 expert_takeover = expert_takeover.to(self.device, dtype=torch.bool).reshape(-1)
-            ready_for_online, online_gate_step = self._rlt_stage2_online_update_gate()
             requested_expert_takeover = expert_takeover
             expert_takeover = expert_takeover & ready_for_online & allow_expert
         else:
             rl_phase = None
             expert_takeover = None
             requested_expert_takeover = None
-            ready_for_online = True
-            online_gate_step = 0
 
         if (
             mode == "train"
             and allow_expert
             and self._has_expert_model_config
             and (
-                (is_rlt_stage2_td3 and use_local_rlt_policy and expert_takeover.any())
+                (
+                    is_rlt_stage2_td3
+                    and rlt_policy_gate_enabled
+                    and expert_takeover is not None
+                    and expert_takeover.any()
+                )
                 or (not is_rlt_stage2_td3)
                 or (
                     is_rlt_stage2_td3
-                    and (not local_rlt_policy_enabled)
+                    and (not rlt_policy_gate_enabled)
                     and self.intervention_enabled
                 )
             )
         ):
             use_expert = (
                 bool(expert_takeover.any().item())
-                if use_local_rlt_policy
+                if is_rlt_stage2_td3
                 else torch.rand(1).item() < self._dagger_sampling_params["beta"]
             )
         else:
@@ -424,7 +451,7 @@ class MultiStepRolloutWorker(Worker):
         with torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
-            if use_local_rlt_policy:
+            if rlt_policy_gate_enabled:
                 student_actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
@@ -436,6 +463,13 @@ class MultiStepRolloutWorker(Worker):
                     self.cfg.actor.model.num_action_chunks,
                     self.cfg.actor.model.action_dim,
                 )
+                if rl_phase is None:
+                    # Full-task Stage2 treats every action chunk as trainable.
+                    rl_phase = torch.ones(
+                        student_actions.shape[0],
+                        dtype=torch.bool,
+                        device=student_actions.device,
+                    )
                 student_control = rl_phase & ready_for_online
                 actions = torch.where(
                     student_control[:, None, None],
@@ -448,6 +482,8 @@ class MultiStepRolloutWorker(Worker):
                     device=actions.device,
                 )
                 if use_expert:
+                    if expert_takeover is None:
+                        expert_takeover = torch.zeros_like(rl_phase)
                     expert_model = self._ensure_expert_model_loaded()
                     if getattr(expert_model, "act_as_vla_reference", False) and hasattr(
                         expert_model, "predict_vla_reference_action_batch"
@@ -480,9 +516,11 @@ class MultiStepRolloutWorker(Worker):
                     actions.device
                 )
                 forward_inputs["intervention_flags"] = intervention_flags
-                forward_inputs["intervention_requested"] = requested_expert_takeover[
-                    :, None
-                ].to(actions.device)
+                if requested_expert_takeover is None:
+                    requested_expert_takeover = torch.zeros_like(rl_phase)
+                forward_inputs["intervention_requested"] = (
+                    requested_expert_takeover[:, None].to(actions.device)
+                )
                 forward_inputs["ready_for_online"] = torch.full(
                     (actions.shape[0], 1),
                     ready_for_online,
@@ -495,11 +533,11 @@ class MultiStepRolloutWorker(Worker):
                     dtype=torch.float32,
                     device=actions.device,
                 )
-                if "deviation" in policy_info:
+                if policy_info is not None and "deviation" in policy_info:
                     forward_inputs["deviation"] = policy_info["deviation"].to(
                         actions.device, dtype=torch.bool
                     )
-                if "takeover_left" in policy_info:
+                if policy_info is not None and "takeover_left" in policy_info:
                     forward_inputs["takeover_left"] = policy_info["takeover_left"].to(
                         actions.device, dtype=torch.float32
                     )

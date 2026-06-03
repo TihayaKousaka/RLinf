@@ -62,6 +62,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
+    def _rlt_stage2_local_phase_enabled(self) -> bool:
+        rlt_phase_cfg = self.cfg.algorithm.get("rlt_phase", {})
+        return bool(rlt_phase_cfg.get("enable", False))
+
     def _resolve_actor_loss_weights(self) -> tuple[float, float, float, bool, float]:
         stage2_cfg = self.cfg.actor.model.rlt_stage2
         loss_warmup_updates = int(
@@ -481,7 +485,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             float(global_counters["transitions_since_train"])
             + float(global_counters["non_rl_transitions_since_train"])
         )
-        if total_seen > 0.0:
+        if total_seen > 0.0 and self._rlt_stage2_local_phase_enabled():
             append_to_dict(
                 metrics,
                 {
