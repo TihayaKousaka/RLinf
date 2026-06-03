@@ -44,22 +44,23 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # 每次触发 Stage2 训练时，learner 连续做多少次 critic update。
-  # critic_actor_ratio=2 时，2000 次 critic update 约对应 1000 次 actor update。
-  update_epoch: 2000
-  # Replay 最少攒多少条 action-chunk transition 后才开始训练。
+  # 每个收集-训练循环里，learner 连续做多少次 critic update。
+  # 对齐 openpi-RLT 的 grad_updates_per_cycle=5；actor 按 critic_actor_ratio=2 更新。
+  update_epoch: 5
+  # Replay 最少攒多少条 action-chunk transition 后才允许训练。
   # 这里的 1 条 transition 是 1 个 10-step action chunk，不是 1 个 env step，
-  # 也不是 1 个 episode；rlt_phase.enable=False 时整条任务的 chunk 都会进入 replay。
+  # 也不是 1 个 episode；它只是最低门槛，不负责主要训练节奏。
   warmup_min_size: 600
   # Stage2 actor 上线前，learner 至少要完成多少次 critic update。
   # 达到这个数之前：train/eval 都执行 base VLA，但 actor/critic 可以后台训练。
   # 达到这个数之后：train/eval 才执行 Stage2 actor 的动作。
-  # 单位是 critic update；openpi-RLT 常用 20000，这里先用 10000 做仿真调试。
-  warmup_post_collect_updates: 10000
-  # 每新增多少条 full-task chunk transition 触发一次训练。
-  # 设 0 表示不按 episode 触发；当前只按 transition 数触发，便于和 replay 对齐。
+  # 单位是 critic update；达到 20000 前只收数据/后台训练，rollout 仍执行 base VLA。
+  warmup_post_collect_updates: 20000
+  # 设 0 表示不按 episode 节奏触发训练；full-task 下 episode 长短会让训练节奏抖动。
   train_every_episodes: 0
-  train_every_transitions: 2000
+  # 这里的 1 不是 batch size，而是“每个 global step 只要收到了新 replay 数据就训练”。
+  # 配合 update_epoch=5，等价于每轮 rollout 后做 5 次 critic update。
+  train_every_transitions: 1
   group_size: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -75,10 +76,13 @@ algorithm:
   tau: 0.005
   # 每几个 critic update 更新一次 actor；2 表示 2 critic : 1 actor。
   critic_actor_ratio: ${actor.model.rlt_stage2.critic_updates_per_actor}
-  # Actor loss 权重 schedule 是额外稳定项，不是 openpi-RLT 的 data warmup。
-  # 当前设为 0，表示 actor loss 从一开始就使用 online_bc/q 权重。
-  actor_loss_warmup_updates: 0
-  actor_loss_ramp_updates: 0
+  # Actor loss 权重 schedule，单位也是 critic update。
+  # base VLA 始终冻结，只提供参考动作 a_tilde；critic 从 replay 学 Q；
+  # actor 先被强 BC 拉住贴近 a_tilde，再逐步增加 Q 目标，避免早期 critic 把 actor 拉飞。
+  # 0-10000：使用 warmup_bc/q；10000-20000：线性切到 online_bc/q；
+  # >=20000：actor 才 ready_for_online，上线控制环境。
+  actor_loss_warmup_updates: 10000
+  actor_loss_ramp_updates: 10000
   target_update_freq: 1
   rlt_phase:
     # rlt_phase 只管“哪些 chunk 走 Stage2/control/replay”，不管 expert 接管。
@@ -271,10 +275,10 @@ actor:
       target_noise_clip: 0.1
       # BC regularizer 的默认权重；如果没有显式 warmup/online 权重会用它。
       bc_regularizer_beta: 5.0
-      # actor_loss_warmup_updates > 0 时使用：高 BC、低 Q，防止早期 critic 拉偏 actor。
+      # actor loss warmup 阶段使用：高 BC、低 Q，让 actor 先贴近 base VLA 的 a_tilde。
       warmup_bc_weight: 7.0
       warmup_q_weight: 0.05
-      # 当前实际使用的 actor loss 权重：
+      # actor loss ramp 结束后的 online 权重：
       # actor_loss = online_bc_weight * BC_loss - online_q_weight * Q + delta_weight * delta_loss。
       online_bc_weight: 3.0
       online_q_weight: 0.1
