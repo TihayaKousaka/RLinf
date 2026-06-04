@@ -1,6 +1,6 @@
 defaults:
-  - env/maniskill_rlt@env.train
-  - env/maniskill_rlt@env.eval
+  - env/maniskill_rlt_joint@env.train
+  - env/maniskill_rlt_joint@env.eval
   - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer

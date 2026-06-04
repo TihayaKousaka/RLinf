@@ -56,18 +56,6 @@ def prepare_actions_for_maniskill(
     action_scale,
     policy,
 ) -> torch.Tensor:
-    if policy == "rlt_maniskill":
-        reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
-        actions = np.asarray(reshaped_actions, dtype=np.float32).copy()
-        # The RLT ManiSkill dataset stores the native normalized
-        # pd_ee_delta_pose action sent to ManiSkill:
-        #   [dx, dy, dz, drotvec_x, drotvec_y, drotvec_z, gripper]
-        # where arm dimensions are in [-1, 1] and map to controller bounds
-        # (+/-0.1 m/rad for Panda), and gripper is +1=open, -1=close.
-        actions[:, :6] = np.clip(actions[:, :6], -1.0, 1.0)
-        actions[:, -1] = np.clip(actions[:, -1], -1.0, 1.0)
-        return torch.from_numpy(actions).reshape(-1, num_action_chunks, action_dim).cuda()
-
     if "panda" in policy:
         return raw_chunk_actions
     # TODO only suitable for action_dim = 7

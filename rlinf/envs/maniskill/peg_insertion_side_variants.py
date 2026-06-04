@@ -17,8 +17,6 @@ from __future__ import annotations
 import gymnasium as gym
 import numpy as np
 
-PEG_INSERTION_SIDE_ENV_ID = "PegInsertionSide-v1"
-PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID = "PegInsertionSideObserverWideWrist-v1"
 PEG_INSERTION_SIDE_WIDE_ENV_ID = "PegInsertionSideWideClearance-v1"
 PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID = (
     "PegInsertionSideWideClearanceObserverWideWrist-v1"
@@ -32,19 +30,12 @@ _PEG_VARIANTS_REGISTERED = False
 
 def is_peg_insertion_side_env_id(env_id: str | None) -> bool:
     return env_id in {
-        PEG_INSERTION_SIDE_ENV_ID,
-        PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID,
         PEG_INSERTION_SIDE_WIDE_ENV_ID,
         PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID,
     }
 
 
 def get_joint_observer_env_id(env_id: str | None) -> str | None:
-    if env_id in {
-        PEG_INSERTION_SIDE_ENV_ID,
-        PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID,
-    }:
-        return PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID
     if env_id in {
         PEG_INSERTION_SIDE_WIDE_ENV_ID,
         PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID,
@@ -58,8 +49,7 @@ def register_rlinf_peg_insertion_side_variants() -> None:
     if _PEG_VARIANTS_REGISTERED:
         return
     if (
-        PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID in gym.registry
-        and PEG_INSERTION_SIDE_WIDE_ENV_ID in gym.registry
+        PEG_INSERTION_SIDE_WIDE_ENV_ID in gym.registry
         and PEG_INSERTION_SIDE_WIDE_OBSERVER_WIDE_WRIST_ENV_ID in gym.registry
     ):
         _PEG_VARIANTS_REGISTERED = True
@@ -228,17 +218,6 @@ def register_rlinf_peg_insertion_side_variants() -> None:
                 self.box = Actor.merge(boxes, "box_with_hole")
                 self.add_to_state_dict_registry(self.peg)
                 self.add_to_state_dict_registry(self.box)
-
-    @register_env(PEG_INSERTION_SIDE_OBSERVER_WIDE_WRIST_ENV_ID, max_episode_steps=100)
-    class PegInsertionSideObserverWideWristEnv(PegInsertionSideEnv):  # type: ignore[unused-ignore]
-        SUPPORTED_ROBOTS = ["panda_wristcam", PANDA_WIDE_WRISTCAM_UID]
-
-        def __init__(self, *args, robot_uids=PANDA_WIDE_WRISTCAM_UID, **kwargs):
-            super().__init__(*args, robot_uids=robot_uids, **kwargs)
-
-        @property
-        def _default_sensor_configs(self):
-            return _observer_sensor_configs(super())
 
     @register_env(PEG_INSERTION_SIDE_WIDE_ENV_ID, max_episode_steps=100)
     class PegInsertionSideWideClearanceEnv(

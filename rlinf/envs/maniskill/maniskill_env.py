@@ -151,51 +151,11 @@ def _extract_tcp_pose_at_robot_base(env, env_index):
     return pose_np[:3], pose_np[3:]
 
 
-def _extract_rlt_state(raw_obs, device, env=None, env_index=None):
-    base_frame_pose = None
-    if env is not None and env_index is not None:
-        base_frame_pose = _extract_tcp_pose_at_robot_base(env, env_index)
-
-    if base_frame_pose is not None:
-        pos, quat_wxyz = base_frame_pose
-    else:
-        pos, quat_wxyz = _extract_tcp_pose(raw_obs)
-
-    rotvec = _quat_wxyz_to_rotvec(quat_wxyz)
-    qpos = _to_numpy(raw_obs["agent"]["qpos"]).astype(np.float32)
-    fingers = qpos[7:9]
-    state = np.concatenate([pos.astype(np.float32), rotvec, fingers], axis=0)
-    return torch.as_tensor(state, device=device, dtype=torch.float32)
-
-
 def _extract_rlt_joint_state(raw_obs, device):
     qpos = _to_numpy(raw_obs["agent"]["qpos"]).astype(np.float32)
     if qpos.shape[0] < 9:
         raise ValueError(f"Expected Panda qpos with at least 9 dims, got {qpos.shape}")
     return torch.as_tensor(qpos[:9], device=device, dtype=torch.float32)
-
-
-def _resolve_camera_rgb(sensor_data, preferred_names, *, fallback_keywords=()):
-    for name in preferred_names:
-        payload = sensor_data.get(name)
-        if isinstance(payload, dict) and "rgb" in payload:
-            return payload["rgb"], name
-
-    lowered_keywords = tuple(k.lower() for k in fallback_keywords)
-    for name, payload in sensor_data.items():
-        if not isinstance(payload, dict) or "rgb" not in payload:
-            continue
-        lowered_name = str(name).lower()
-        if any(keyword in lowered_name for keyword in lowered_keywords):
-            return payload["rgb"], name
-
-    for name, payload in sensor_data.items():
-        if isinstance(payload, dict) and "rgb" in payload:
-            return payload["rgb"], name
-
-    raise KeyError(
-        f"Could not find any RGB camera in sensor_data. Available keys: {list(sensor_data.keys())}"
-    )
 
 
 def _normalize_peg_instruction(instruction):
@@ -414,75 +374,6 @@ class ManiskillEnv(gym.Env):
                     "states": state,
                 }
 
-        if wrap_obs_mode == "rlt_openpi":
-            if self.env.unwrapped.obs_mode != "rgb":
-                raise ValueError(
-                    "wrap_obs_mode='rlt_openpi' requires ManiSkill obs_mode='rgb'."
-                )
-            sensor_data = raw_obs.pop("sensor_data")
-            raw_obs.pop("sensor_param")
-
-            main_images = sensor_data["base_camera"]["rgb"]
-            wrist_images = (
-                sensor_data["hand_camera"]["rgb"]
-                if "hand_camera" in sensor_data
-                else None
-            )
-            extra_view_images = None
-            if "right_camera" in sensor_data:
-                extra_view_images = sensor_data["right_camera"]["rgb"].unsqueeze(1)
-
-            if infos is not None and "prompt" in infos:
-                task_descriptions = infos["prompt"]
-                if self._is_peg_insertion_side:
-                    if isinstance(task_descriptions, str):
-                        task_descriptions = [
-                            _normalize_peg_instruction(task_descriptions)
-                            for _ in range(self.num_envs)
-                        ]
-                    else:
-                        task_descriptions = [
-                            _normalize_peg_instruction(item)
-                            for item in task_descriptions
-                        ]
-            else:
-                task_descriptions = self.instruction
-
-            return {
-                "main_images": main_images,
-                "wrist_images": wrist_images,
-                "extra_view_images": extra_view_images,
-                "states": torch.stack(
-                    [
-                        _extract_rlt_state(
-                            {
-                                "agent": {
-                                    "qpos": raw_obs["agent"]["qpos"][i],
-                                    **(
-                                        {"tcp_pose": raw_obs["agent"]["tcp_pose"][i]}
-                                        if isinstance(raw_obs["agent"], dict)
-                                        and "tcp_pose" in raw_obs["agent"]
-                                        else {}
-                                    ),
-                                },
-                                "extra": (
-                                    {"tcp_pose": raw_obs["extra"]["tcp_pose"][i]}
-                                    if isinstance(raw_obs.get("extra"), dict)
-                                    and "tcp_pose" in raw_obs["extra"]
-                                    else {}
-                                ),
-                            },
-                            self.device,
-                            env=self.env.unwrapped,
-                            env_index=i,
-                        )
-                        for i in range(main_images.shape[0])
-                    ],
-                    dim=0,
-                ),
-                "task_descriptions": task_descriptions,
-            }
-
         if wrap_obs_mode == "rlt_openpi_joint":
             if self.env.unwrapped.obs_mode != "rgb":
                 raise ValueError(
@@ -490,21 +381,8 @@ class ManiskillEnv(gym.Env):
                 )
             sensor_data = raw_obs.pop("sensor_data")
             raw_obs.pop("sensor_param")
-
-            main_images, main_name = _resolve_camera_rgb(
-                sensor_data,
-                preferred_names=("3rd_view_camera", "base_camera", "c19_front_view"),
-                fallback_keywords=("3rd", "third", "front", "base", "main"),
-            )
-            wrist_images = None
-            for wrist_name in ("wide_hand_camera", "hand_camera"):
-                wrist_payload = sensor_data.get(wrist_name)
-                if isinstance(wrist_payload, dict) and "rgb" in wrist_payload:
-                    wrist_images = wrist_payload["rgb"]
-                    break
-            extra_view_images = None
-            if "right_camera" in sensor_data and main_name != "right_camera":
-                extra_view_images = sensor_data["right_camera"]["rgb"].unsqueeze(1)
+            main_images = sensor_data["3rd_view_camera"]["rgb"]
+            wrist_images = sensor_data["wide_hand_camera"]["rgb"]
 
             if infos is not None and "prompt" in infos:
                 task_descriptions = infos["prompt"]
@@ -525,7 +403,7 @@ class ManiskillEnv(gym.Env):
             return {
                 "main_images": main_images,
                 "wrist_images": wrist_images,
-                "extra_view_images": extra_view_images,
+                "extra_view_images": None,
                 "states": torch.stack(
                     [
                         _extract_rlt_joint_state(
