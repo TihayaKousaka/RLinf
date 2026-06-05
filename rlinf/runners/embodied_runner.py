@@ -351,6 +351,15 @@ class EmbodiedRunner:
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+        if start_step == 0 and bool(self.cfg.runner.get("eval_before_train", False)):
+            with self.timer("eval"):
+                self.actor.set_global_step(self.global_step)
+                self.rollout.set_global_step(self.global_step)
+                self.update_rollout_weights()
+                eval_metrics = self.evaluate()
+                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                self.metric_logger.log(data=eval_metrics, step=0)
+
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)

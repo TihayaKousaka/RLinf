@@ -66,22 +66,8 @@ class Stage2VLAWrapper:
         self,
         obs: dict[str, Any],
     ) -> tuple[_model.Observation, dict[str, Any]]:
-        if (
-            "tokenized_prompt" in obs
-            and "tokenized_prompt_mask" in obs
-            and "main_images" in obs
-            and "states" in obs
-        ):
-            to_process_obs = {
-                "observation/image": obs["main_images"],
-                "observation/state": obs["states"],
-                "tokenized_prompt": obs["tokenized_prompt"],
-                "tokenized_prompt_mask": obs["tokenized_prompt_mask"],
-            }
-            if obs.get("wrist_images") is not None:
-                to_process_obs["observation/wrist_image"] = obs["wrist_images"]
-            if obs.get("extra_view_images") is not None:
-                to_process_obs["observation/extra_view_image"] = obs["extra_view_images"]
+        if self._has_pre_tokenized_env_obs(obs):
+            to_process_obs = self._openpi_obs_from_pre_tokenized_env_obs(obs)
         elif "task_descriptions" in obs and obs["task_descriptions"] is not None:
             to_process_obs = self.model.obs_processor(obs)
         else:
@@ -91,6 +77,39 @@ class Stage2VLAWrapper:
         processed = self.model.input_transform(to_process_obs, transpose=False)
         processed = self.model.precision_processor(processed)
         return _model.Observation.from_dict(processed), processed
+
+    @staticmethod
+    def _has_pre_tokenized_env_obs(obs: dict[str, Any]) -> bool:
+        return (
+            "tokenized_prompt" in obs
+            and "tokenized_prompt_mask" in obs
+            and "main_images" in obs
+            and "states" in obs
+        )
+
+    @staticmethod
+    def _openpi_obs_from_pre_tokenized_env_obs(obs: dict[str, Any]) -> dict[str, Any]:
+        to_process_obs = {
+            "observation/image": obs["main_images"],
+            "observation/state": obs["states"],
+            "tokenized_prompt": obs["tokenized_prompt"],
+            "tokenized_prompt_mask": obs["tokenized_prompt_mask"],
+        }
+        if obs.get("wrist_images") is not None:
+            to_process_obs["observation/wrist_image"] = obs["wrist_images"]
+        if obs.get("extra_view_images") is not None:
+            to_process_obs["observation/extra_view_image"] = obs["extra_view_images"]
+        return to_process_obs
+
+    def extract_proprio(
+        self,
+        observation: _model.Observation,
+        proprio_dim: int,
+    ) -> torch.Tensor:
+        return observation.state[:, :proprio_dim].to(
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     def preprocess_obs(self, obs: dict[str, Any]) -> _model.Observation:
         observation, _ = self.prepare_obs(obs)

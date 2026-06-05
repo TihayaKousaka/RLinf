@@ -21,7 +21,7 @@ import openpi.transforms as _transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
 from typing_extensions import override
 
-from rlinf.models.embodiment.openpi.policies import rlt_maniskill_joint_policy
+from rlinf.models.embodiment.openpi.policies import maniskill_policy
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,8 +34,8 @@ class LeRobotRLTManiSkillJointDataConfig(DataConfigFactory):
     extra_view_image_key: str | None = None
     state_key: str = "state"
     action_key: str = "actions"
-    task_key: str = "task"
-    prompt_key: str = "prompt"
+    task_key: str | None = None
+    prompt_key: str | None = None
     norm_stats_path: str | None = None
     default_prompt: str | None = None
 
@@ -68,9 +68,11 @@ class LeRobotRLTManiSkillJointDataConfig(DataConfigFactory):
             "observation/wrist_image": self.wrist_image_key,
             "observation/state": self.state_key,
             "actions": self.action_key,
-            "prompt": self.prompt_key,
-            "task": self.task_key,
         }
+        if self.prompt_key is not None:
+            repack_structure["prompt"] = self.prompt_key
+        if self.task_key is not None:
+            repack_structure["task"] = self.task_key
         if self.extra_view_image_key is not None:
             repack_structure["observation/extra_view_image"] = (
                 self.extra_view_image_key
@@ -82,12 +84,13 @@ class LeRobotRLTManiSkillJointDataConfig(DataConfigFactory):
 
         data_transforms = _transforms.Group(
             inputs=[
-                rlt_maniskill_joint_policy.RLTManiSkillJointInputs(
+                maniskill_policy.ManiSkillInputs(
                     model_type=model_config.model_type,
+                    use_wrist_image=True,
                     default_prompt=self.default_prompt,
                 )
             ],
-            outputs=[rlt_maniskill_joint_policy.RLTManiSkillJointOutputs()],
+            outputs=[maniskill_policy.ManiSkillOutputs(output_action_dim=8)],
         )
 
         if self.extra_delta_transform:

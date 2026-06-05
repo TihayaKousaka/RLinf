@@ -39,6 +39,9 @@ runner:
   weight_sync_interval: 1
   # Eval/保存间隔，单位是 runner global step。
   val_check_interval: 50
+  # 训练开始前先在 step=0 跑一次 eval，记录初始 base/student policy 的真实性能。
+  # 这次 eval 不收 replay、不训练，只提供和后续 checkpoint 可比的 baseline。
+  eval_before_train: True
   save_interval: 50
   resume_dir: null
   ckpt_path: null

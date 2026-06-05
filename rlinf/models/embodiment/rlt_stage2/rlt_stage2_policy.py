@@ -206,10 +206,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self._validate_action_chunk(a_tilde, name="a_tilde")
         a_tilde_flat = a_tilde.reshape(a_tilde.shape[0], -1)
         self._validate_flat_action(a_tilde_flat, name="a_tilde_flat")
-        state = observation.state[:, : self.proprio_dim].to(
-            device=self.device,
-            dtype=torch.float32,
-        )
+        state = self.vla.extract_proprio(observation, self.proprio_dim)
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
         return x, a_tilde_flat, processed_obs
 

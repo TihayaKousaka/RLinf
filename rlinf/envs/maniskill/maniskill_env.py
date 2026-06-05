@@ -33,6 +33,12 @@ from rlinf.envs.maniskill.peg_insertion_side_variants import (
 
 __all__ = ["ManiskillEnv"]
 
+_RLT_JOINT_STATE_DIM = 9
+_RLT_MAIN_CAMERA_KEY = "3rd_view_camera"
+_RLT_WRIST_CAMERA_KEY = "wide_hand_camera"
+_RLT_DEFAULT_PROMPT = "insert the peg in the hole"
+_RLT_LEGACY_PEG_PROMPT = "insert the peg into the hole"
+
 def _to_bool_tensor(value, *, num_envs, device):
     if isinstance(value, bool):
         return torch.full((num_envs,), value, dtype=torch.bool, device=device)
@@ -73,6 +79,40 @@ def _to_numpy(x):
     if arr.ndim > 0 and arr.shape[0] == 1:
         arr = arr[0]
     return arr
+
+
+def _normalize_peg_instruction(instruction):
+    if isinstance(instruction, str) and instruction == _RLT_LEGACY_PEG_PROMPT:
+        return _RLT_DEFAULT_PROMPT
+    return instruction
+
+
+def _normalize_peg_instructions(instructions, *, num_envs):
+    if isinstance(instructions, str):
+        return [_normalize_peg_instruction(instructions) for _ in range(num_envs)]
+    return [_normalize_peg_instruction(item) for item in instructions]
+
+
+def _extract_rlt_joint_state(qpos, device):
+    qpos = _to_numpy(qpos).astype(np.float32)
+    if qpos.shape[0] < _RLT_JOINT_STATE_DIM:
+        raise ValueError(
+            f"Expected Panda qpos with at least {_RLT_JOINT_STATE_DIM} dims, got {qpos.shape}"
+        )
+    return torch.as_tensor(
+        qpos[:_RLT_JOINT_STATE_DIM], device=device, dtype=torch.float32
+    )
+
+
+def _extract_rlt_joint_states(raw_obs, *, batch_size, device):
+    qpos = raw_obs["agent"]["qpos"]
+    return torch.stack(
+        [
+            _extract_rlt_joint_state(qpos[index], device)
+            for index in range(batch_size)
+        ],
+        dim=0,
+    )
 
 
 def _quat_wxyz_to_rotvec(quat_wxyz):
@@ -149,19 +189,6 @@ def _extract_tcp_pose_at_robot_base(env, env_index):
     if pose_np.shape[-1] != 7:
         return None
     return pose_np[:3], pose_np[3:]
-
-
-def _extract_rlt_joint_state(raw_obs, device):
-    qpos = _to_numpy(raw_obs["agent"]["qpos"]).astype(np.float32)
-    if qpos.shape[0] < 9:
-        raise ValueError(f"Expected Panda qpos with at least 9 dims, got {qpos.shape}")
-    return torch.as_tensor(qpos[:9], device=device, dtype=torch.float32)
-
-
-def _normalize_peg_instruction(instruction):
-    if isinstance(instruction, str) and instruction == "insert the peg into the hole":
-        return "insert the peg in the hole"
-    return instruction
 
 
 def _shape_str(value):
@@ -311,8 +338,37 @@ class ManiskillEnv(gym.Env):
             return instruction
 
         if self._is_peg_insertion_side:
-            return ["insert the peg in the hole" for _ in range(self.num_envs)]
+            return [_RLT_DEFAULT_PROMPT for _ in range(self.num_envs)]
         return ["" for _ in range(self.num_envs)]
+
+    def _wrap_rlt_openpi_joint_obs(self, raw_obs, infos=None):
+        sensor_data = raw_obs.pop("sensor_data")
+        raw_obs.pop("sensor_param")
+
+        main_images = sensor_data[_RLT_MAIN_CAMERA_KEY]["rgb"]
+        wrist_images = sensor_data[_RLT_WRIST_CAMERA_KEY]["rgb"]
+
+        if infos is not None and "prompt" in infos:
+            task_descriptions = infos["prompt"]
+            if self._is_peg_insertion_side:
+                task_descriptions = _normalize_peg_instructions(
+                    task_descriptions,
+                    num_envs=self.num_envs,
+                )
+        else:
+            task_descriptions = self.instruction
+
+        return {
+            "main_images": main_images,
+            "wrist_images": wrist_images,
+            "extra_view_images": None,
+            "states": _extract_rlt_joint_states(
+                raw_obs,
+                batch_size=main_images.shape[0],
+                device=self.device,
+            ),
+            "task_descriptions": task_descriptions,
+        }
 
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
@@ -380,47 +436,7 @@ class ManiskillEnv(gym.Env):
                 raise ValueError(
                     "wrap_obs_mode='rlt_openpi_joint' requires ManiSkill obs_mode='rgb'."
                 )
-            sensor_data = raw_obs.pop("sensor_data")
-            raw_obs.pop("sensor_param")
-            main_images = sensor_data["3rd_view_camera"]["rgb"]
-            wrist_images = sensor_data["wide_hand_camera"]["rgb"]
-
-            if infos is not None and "prompt" in infos:
-                task_descriptions = infos["prompt"]
-                if self._is_peg_insertion_side:
-                    if isinstance(task_descriptions, str):
-                        task_descriptions = [
-                            _normalize_peg_instruction(task_descriptions)
-                            for _ in range(self.num_envs)
-                        ]
-                    else:
-                        task_descriptions = [
-                            _normalize_peg_instruction(item)
-                            for item in task_descriptions
-                        ]
-            else:
-                task_descriptions = self.instruction
-
-            return {
-                "main_images": main_images,
-                "wrist_images": wrist_images,
-                "extra_view_images": None,
-                "states": torch.stack(
-                    [
-                        _extract_rlt_joint_state(
-                            {
-                                "agent": {
-                                    "qpos": raw_obs["agent"]["qpos"][i],
-                                }
-                            },
-                            self.device,
-                        )
-                        for i in range(main_images.shape[0])
-                    ],
-                    dim=0,
-                ),
-                "task_descriptions": task_descriptions,
-            }
+            return self._wrap_rlt_openpi_joint_obs(raw_obs, infos=infos)
 
         # Default
         obs_image = raw_obs["sensor_data"]["3rd_view_camera"]["rgb"].to(

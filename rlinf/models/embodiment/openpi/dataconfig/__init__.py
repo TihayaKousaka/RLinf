@@ -160,7 +160,7 @@ _CONFIGS = [
         ),
         data=LeRobotRLTManiSkillJointDataConfig(
             repo_id="rlt_maniskill_joint",
-            base_config=DataConfig(prompt_from_task=True),
+            base_config=DataConfig(prompt_from_task=False),
             assets=AssetsConfig(
                 assets_dir="checkpoints/torch/pi05_rlt_maniskill_joint/assets"
             ),
