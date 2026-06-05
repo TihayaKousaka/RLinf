@@ -53,10 +53,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         )
         self._rollout_sync_key_count = 0
         self.transitions_since_train = 0
-        self.non_rl_transitions_since_train = 0
         self.episodes_since_train = 0
         self.total_transitions_added = 0
-        self.total_non_rl_transitions = 0
         self.total_episodes_added = 0
 
         weight_syncer_cfg = cfg.get("weight_syncer", None)
@@ -64,10 +62,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             "weight_syncer config must be provided for RLT stage2 actor worker."
         )
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
-
-    def _rlt_stage2_local_phase_enabled(self) -> bool:
-        rlt_phase_cfg = self.cfg.algorithm.get("rlt_phase", {})
-        return bool(rlt_phase_cfg.get("enable", False))
 
     def _warmup_required_updates(self) -> int:
         warmup_required_updates = int(
@@ -274,60 +268,34 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad(True)
 
-    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int, int]:
+    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
         if self.replay_buffer is None or traj.actions is None or not traj.forward_inputs:
-            return 0, 0, 0
+            return 0, 0
 
         traj_len = traj.actions.shape[0]
         bsz = traj.actions.shape[1]
         added = 0
-        skipped_non_rl = 0
         completed_episodes = 0
 
         x_all = traj.forward_inputs.get("x")
         a_tilde_all = traj.forward_inputs.get("a_tilde")
         if x_all is None or a_tilde_all is None:
-            return 0, 0, 0
+            return 0, 0
 
         dones_all = traj.dones
         rewards_all = traj.rewards
         if dones_all is None or rewards_all is None:
-            return 0, 0, 0
+            return 0, 0
         intervention_flags_all = traj.forward_inputs.get("intervention_flags")
         if intervention_flags_all is None:
             intervention_flags_all = traj.intervene_flags
-        rl_phase_all = traj.forward_inputs.get("rl_phase")
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
 
         for env_idx in range(bsz):
             for t in range(traj_len):
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 env_done = float(dones_all[done_idx, env_idx].any().item())
-                in_rl_phase = True
-                next_in_rl_phase = True
-                if rl_phase_all is not None:
-                    in_rl_phase = bool(
-                        rl_phase_all[t, env_idx].detach().bool().any().item()
-                    )
-                    if t + 1 < rl_phase_all.shape[0]:
-                        next_in_rl_phase = bool(
-                            rl_phase_all[t + 1, env_idx]
-                            .detach()
-                            .bool()
-                            .any()
-                            .item()
-                        )
-                    else:
-                        next_in_rl_phase = False
-                if not in_rl_phase:
-                    if env_done > 0.0:
-                        completed_episodes += 1
-                        if not auto_reset:
-                            break
-                    skipped_non_rl += 1
-                    continue
-                phase_done = rl_phase_all is not None and not next_in_rl_phase
-                done = float(env_done > 0.0 or phase_done)
+                done = float(env_done > 0.0)
                 intervention = 0.0
                 if intervention_flags_all is not None:
                     intervention = float(
@@ -414,7 +382,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     if not auto_reset:
                         break
 
-        return added, skipped_non_rl, completed_episodes
+        return added, completed_episodes
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         clear_memory(sync=False)
@@ -425,26 +393,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
         for _ in range(split_num):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            added, skipped_non_rl, completed_episodes = self._trajectory_to_transitions(
-                trajectory
-            )
+            added, completed_episodes = self._trajectory_to_transitions(trajectory)
             self.transitions_since_train += added
-            self.non_rl_transitions_since_train += skipped_non_rl
             self.episodes_since_train += completed_episodes
             self.total_transitions_added += added
-            self.total_non_rl_transitions += skipped_non_rl
             self.total_episodes_added += completed_episodes
 
     def _global_rollout_counters(self) -> dict[str, float]:
         return all_reduce_dict(
             {
                 "transitions_since_train": float(self.transitions_since_train),
-                "non_rl_transitions_since_train": float(
-                    self.non_rl_transitions_since_train
-                ),
                 "episodes_since_train": float(self.episodes_since_train),
                 "total_transitions_added": float(self.total_transitions_added),
-                "total_non_rl_transitions": float(self.total_non_rl_transitions),
                 "total_episodes_added": float(self.total_episodes_added),
             },
             op=torch.distributed.ReduceOp.SUM,
@@ -502,20 +462,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 ),
             },
         )
-        total_seen = (
-            float(global_counters["transitions_since_train"])
-            + float(global_counters["non_rl_transitions_since_train"])
-        )
-        if total_seen > 0.0 and self._rlt_stage2_local_phase_enabled():
-            append_to_dict(
-                metrics,
-                {
-                    "rlt_stage2/rl_phase_transition_rate": float(
-                        global_counters["transitions_since_train"]
-                    )
-                    / total_seen
-                },
-            )
 
     def _append_replay_stats(self, metrics: dict[str, Any]) -> None:
         if self.replay_buffer is None:
@@ -679,7 +625,6 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             actor_updates_run=actor_updates_run,
         )
         self.transitions_since_train = 0
-        self.non_rl_transitions_since_train = 0
         self.episodes_since_train = 0
         return self._process_train_metrics(metrics)
 
@@ -873,10 +818,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 "warmup_ready_total_episodes": self.warmup_ready_total_episodes,
                 "version": self.version,
                 "transitions_since_train": self.transitions_since_train,
-                "non_rl_transitions_since_train": self.non_rl_transitions_since_train,
                 "episodes_since_train": self.episodes_since_train,
                 "total_transitions_added": self.total_transitions_added,
-                "total_non_rl_transitions": self.total_non_rl_transitions,
                 "total_episodes_added": self.total_episodes_added,
                 "replay_buffer": self.replay_buffer.state_dict()
                 if self.replay_buffer is not None
@@ -925,14 +868,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             self.transitions_since_train = int(
                 state.get("transitions_since_train", 0)
             )
-            self.non_rl_transitions_since_train = int(
-                state.get("non_rl_transitions_since_train", 0)
-            )
             self.episodes_since_train = int(state.get("episodes_since_train", 0))
             self.total_transitions_added = int(state.get("total_transitions_added", 0))
-            self.total_non_rl_transitions = int(
-                state.get("total_non_rl_transitions", 0)
-            )
             self.total_episodes_added = int(state.get("total_episodes_added", 0))
             if self.replay_buffer is not None and state.get("replay_buffer") is not None:
                 self.replay_buffer.load_state_dict(state["replay_buffer"])

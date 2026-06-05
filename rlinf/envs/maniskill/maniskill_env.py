@@ -239,6 +239,7 @@ class ManiskillEnv(gym.Env):
         self._show_goal_site_visual()
         if self.record_metrics:
             self._init_metrics()
+        self._init_persistent_done_state()
 
     @property
     def total_num_group_envs(self):
@@ -632,6 +633,50 @@ class ManiskillEnv(gym.Env):
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
 
+    def _init_persistent_done_state(self):
+        self._persistent_done_mask = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._persistent_done_obs = None
+        self._persistent_done_infos = None
+
+    def _reset_persistent_done_state(self, env_idx=None):
+        if not hasattr(self, "_persistent_done_mask"):
+            self._init_persistent_done_state()
+            return
+
+        if env_idx is None:
+            self._persistent_done_mask.zero_()
+            self._persistent_done_obs = None
+            self._persistent_done_infos = None
+            return
+
+        self._persistent_done_mask[env_idx] = False
+
+    def _update_persistent_done_state(self, dones, extracted_obs, infos):
+        if self.auto_reset or not dones.any():
+            return
+
+        newly_done = dones & (~self._persistent_done_mask)
+        if not newly_done.any():
+            return
+
+        if self._persistent_done_obs is None:
+            self._persistent_done_obs = torch_clone_dict(extracted_obs)
+        else:
+            self._persistent_done_obs = self._restore_frozen_values(
+                self._persistent_done_obs, extracted_obs, newly_done
+            )
+
+        if self._persistent_done_infos is None:
+            self._persistent_done_infos = torch_clone_dict(infos)
+        else:
+            self._persistent_done_infos = self._restore_frozen_values(
+                self._persistent_done_infos, infos, newly_done
+            )
+
+        self._persistent_done_mask |= newly_done
+
     def _record_metrics(self, step_reward, infos):
         episode_info = {}
         self.returns += step_reward
@@ -670,6 +715,7 @@ class ManiskillEnv(gym.Env):
         else:
             self._reset_peg_insertion_event_state()
             self._reset_metrics()
+        self._reset_persistent_done_state(options.get("env_idx"))
         return extracted_obs, infos
 
     def step(
@@ -759,20 +805,21 @@ class ManiskillEnv(gym.Env):
         actions[frozen_mask] = 0.0
         return actions
 
-    def _restore_frozen_info_values(self, infos, previous_infos, mask):
-        if not isinstance(infos, dict) or not isinstance(previous_infos, dict):
-            return infos
+    def _restore_frozen_values(self, values, previous_values, mask):
+        if not isinstance(values, dict) or not isinstance(previous_values, dict):
+            return values
 
-        restored = torch_clone_dict(infos)
-        for key, prev_value in previous_infos.items():
+        restored = torch_clone_dict(values)
+        for key, prev_value in previous_values.items():
             if key not in restored:
                 continue
             value = restored[key]
             if isinstance(value, torch.Tensor) and isinstance(prev_value, torch.Tensor):
                 if value.ndim > 0 and value.shape[0] == self.num_envs:
-                    value[mask] = prev_value[mask].to(value.device)
+                    value_mask = mask.to(device=value.device)
+                    value[value_mask] = prev_value.to(value.device)[value_mask]
             elif isinstance(value, dict) and isinstance(prev_value, dict):
-                restored[key] = self._restore_frozen_info_values(
+                restored[key] = self._restore_frozen_values(
                     value, prev_value, mask
                 )
             elif isinstance(value, list) and isinstance(prev_value, list):
@@ -785,6 +832,9 @@ class ManiskillEnv(gym.Env):
                     ):
                         value[env_idx] = prev_value[env_idx]
         return restored
+
+    def _restore_frozen_info_values(self, infos, previous_infos, mask):
+        return self._restore_frozen_values(infos, previous_infos, mask)
 
     def _validate_chunk_actions(self, chunk_actions) -> None:
         if not hasattr(chunk_actions, "shape") or len(chunk_actions.shape) != 3:
@@ -822,9 +872,23 @@ class ManiskillEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        frozen_dones = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        last_extracted_obs = None
-        last_infos = None
+        if not hasattr(self, "_persistent_done_mask"):
+            self._init_persistent_done_state()
+        frozen_dones = (
+            self._persistent_done_mask.clone()
+            if not self.auto_reset
+            else torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        )
+        last_extracted_obs = (
+            torch_clone_dict(self._persistent_done_obs)
+            if frozen_dones.any() and self._persistent_done_obs is not None
+            else None
+        )
+        last_infos = (
+            torch_clone_dict(self._persistent_done_infos)
+            if frozen_dones.any() and self._persistent_done_infos is not None
+            else None
+        )
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             if (
@@ -851,23 +915,20 @@ class ManiskillEnv(gym.Env):
                 )
                 if frozen_dones.any():
                     self._restore_episode_state(state_before_step, frozen_dones)
-                    prev_obs = torch_clone_dict(last_extracted_obs)
-                    for key, value in extracted_obs.items():
-                        if (
-                            key in prev_obs
-                            and isinstance(value, torch.Tensor)
-                            and isinstance(prev_obs[key], torch.Tensor)
-                        ):
-                            value[frozen_dones] = prev_obs[key][frozen_dones]
+                    if last_extracted_obs is not None:
+                        extracted_obs = self._restore_frozen_values(
+                            extracted_obs, last_extracted_obs, frozen_dones
+                        )
                     step_reward = step_reward.clone()
                     step_reward[frozen_dones] = 0.0
                     terminations = terminations.clone()
                     truncations = truncations.clone()
                     terminations[frozen_dones] = False
                     truncations[frozen_dones] = False
-                    infos = self._restore_frozen_info_values(
-                        infos, last_infos, frozen_dones
-                    )
+                    if last_infos is not None:
+                        infos = self._restore_frozen_info_values(
+                            infos, last_infos, frozen_dones
+                        )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
@@ -894,6 +955,8 @@ class ManiskillEnv(gym.Env):
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(
                 past_dones, obs_list[-1], infos_list[-1]
             )
+        elif past_dones.any():
+            self._update_persistent_done_state(past_dones, obs_list[-1], infos_list[-1])
         return (
             obs_list,
             chunk_rewards,

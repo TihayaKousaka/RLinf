@@ -369,57 +369,20 @@ class MultiStepRolloutWorker(Worker):
             "only_save_expert", True
         )
         is_rlt_stage2_td3 = self._is_rlt_stage2_td3()
-        rlt_phase_cfg = self.cfg.algorithm.get("rlt_phase", {})
-        local_phase_enabled = bool(rlt_phase_cfg.get("enable", False))
-        local_rlt_policy_enabled = is_rlt_stage2_td3 and local_phase_enabled
-        full_task_rlt_policy_enabled = is_rlt_stage2_td3 and not local_phase_enabled
-        if local_rlt_policy_enabled and policy_info is None:
-            raise RuntimeError(
-                "RLT local phase control is enabled, but rollout received no "
-                "env policy_info. Refuse to run with ambiguous phase state; "
-                "check EnvWorker train bootstrap/interact policy_info plumbing."
-            )
-        rlt_policy_gate_enabled = is_rlt_stage2_td3
-        if rlt_policy_gate_enabled:
+        if is_rlt_stage2_td3:
             ready_for_online, online_gate_step = self._rlt_stage2_online_update_gate()
         else:
             ready_for_online = True
             online_gate_step = 0
 
-        if full_task_rlt_policy_enabled:
-            rl_phase = None
-            expert_takeover = None
-            if policy_info is not None:
-                rl_phase = policy_info.get("rl_phase")
-                if rl_phase is not None:
-                    rl_phase = rl_phase.to(self.device, dtype=torch.bool).reshape(-1)
-                expert_takeover = policy_info.get("expert_takeover")
-                if expert_takeover is not None:
-                    expert_takeover = expert_takeover.to(
-                        self.device, dtype=torch.bool
-                    ).reshape(-1)
-            requested_expert_takeover = None
+        expert_takeover = None
+        requested_expert_takeover = None
+        if is_rlt_stage2_td3 and policy_info is not None:
+            expert_takeover = policy_info.get("expert_takeover")
             if expert_takeover is not None:
+                expert_takeover = expert_takeover.to(self.device, dtype=torch.bool).reshape(-1)
                 requested_expert_takeover = expert_takeover
                 expert_takeover = expert_takeover & ready_for_online & allow_expert
-        elif local_rlt_policy_enabled and policy_info is not None:
-            rl_phase = policy_info.get("rl_phase")
-            expert_takeover = policy_info.get("expert_takeover")
-            if rl_phase is None:
-                raise RuntimeError(
-                    "RLT local phase control is enabled but env policy_info is missing rl_phase."
-                )
-            rl_phase = rl_phase.to(self.device, dtype=torch.bool).reshape(-1)
-            if expert_takeover is None:
-                expert_takeover = torch.zeros_like(rl_phase)
-            else:
-                expert_takeover = expert_takeover.to(self.device, dtype=torch.bool).reshape(-1)
-            requested_expert_takeover = expert_takeover
-            expert_takeover = expert_takeover & ready_for_online & allow_expert
-        else:
-            rl_phase = None
-            expert_takeover = None
-            requested_expert_takeover = None
 
         if (
             mode == "train"
@@ -428,16 +391,10 @@ class MultiStepRolloutWorker(Worker):
             and (
                 (
                     is_rlt_stage2_td3
-                    and rlt_policy_gate_enabled
                     and expert_takeover is not None
                     and expert_takeover.any()
                 )
                 or (not is_rlt_stage2_td3)
-                or (
-                    is_rlt_stage2_td3
-                    and (not rlt_policy_gate_enabled)
-                    and self.intervention_enabled
-                )
             )
         ):
             use_expert = (
@@ -450,8 +407,7 @@ class MultiStepRolloutWorker(Worker):
 
         with torch.no_grad():
             expert_label_flag = False
-            # Decide which model to act via use_expert
-            if rlt_policy_gate_enabled:
+            if is_rlt_stage2_td3:
                 student_actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
@@ -463,18 +419,14 @@ class MultiStepRolloutWorker(Worker):
                     self.cfg.actor.model.num_action_chunks,
                     self.cfg.actor.model.action_dim,
                 )
-                if rl_phase is None:
-                    # Full-task Stage2 treats every action chunk as trainable.
-                    rl_phase = torch.ones(
-                        student_actions.shape[0],
-                        dtype=torch.bool,
-                        device=student_actions.device,
-                    )
-                student_control = rl_phase & ready_for_online
-                actions = torch.where(
-                    student_control[:, None, None],
-                    student_actions,
-                    base_actions,
+                student_control = torch.full(
+                    (student_actions.shape[0],),
+                    ready_for_online,
+                    dtype=torch.bool,
+                    device=student_actions.device,
+                )
+                actions = (
+                    student_actions if ready_for_online else base_actions
                 )
                 intervention_flags = torch.zeros(
                     (actions.shape[0], self.cfg.actor.model.num_action_chunks),
@@ -483,7 +435,7 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if use_expert:
                     if expert_takeover is None:
-                        expert_takeover = torch.zeros_like(rl_phase)
+                        expert_takeover = torch.zeros_like(student_control)
                     expert_model = self._ensure_expert_model_loaded()
                     if getattr(expert_model, "act_as_vla_reference", False) and hasattr(
                         expert_model, "predict_vla_reference_action_batch"
@@ -511,13 +463,12 @@ class MultiStepRolloutWorker(Worker):
                 action_flat = actions.reshape(actions.shape[0], -1)
                 forward_inputs["base_a_tilde"] = base_flat
                 forward_inputs["action"] = action_flat.detach()
-                forward_inputs["rl_phase"] = rl_phase[:, None].to(actions.device)
                 forward_inputs["student_control"] = student_control[:, None].to(
                     actions.device
                 )
                 forward_inputs["intervention_flags"] = intervention_flags
                 if requested_expert_takeover is None:
-                    requested_expert_takeover = torch.zeros_like(rl_phase)
+                    requested_expert_takeover = torch.zeros_like(student_control)
                 forward_inputs["intervention_requested"] = (
                     requested_expert_takeover[:, None].to(actions.device)
                 )
@@ -541,37 +492,6 @@ class MultiStepRolloutWorker(Worker):
                     forward_inputs["takeover_left"] = policy_info["takeover_left"].to(
                         actions.device, dtype=torch.float32
                     )
-            elif use_expert and is_rlt_stage2_td3:
-                _, result = self.hf_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
-                expert_model = self._ensure_expert_model_loaded()
-                if getattr(expert_model, "act_as_vla_reference", False) and hasattr(
-                    expert_model, "predict_vla_reference_action_batch"
-                ):
-                    actions, _ = expert_model.predict_vla_reference_action_batch(
-                        env_obs=env_obs,
-                        **kwargs,
-                    )
-                else:
-                    actions, _ = expert_model.predict_action_batch(
-                        env_obs=env_obs,
-                        **kwargs,
-                    )
-                action_flat = actions.reshape(actions.shape[0], -1)
-                forward_inputs = result["forward_inputs"]
-                if "a_tilde" in forward_inputs:
-                    forward_inputs["base_a_tilde"] = forward_inputs["a_tilde"].detach()
-                    forward_inputs["a_tilde"] = action_flat.detach()
-                forward_inputs["action"] = action_flat.detach()
-                forward_inputs["intervention_flags"] = torch.full(
-                    (actions.shape[0], self.cfg.actor.model.num_action_chunks),
-                    True,
-                    dtype=torch.bool,
-                    device=actions.device,
-                )
-                expert_label_flag = True
             elif use_expert:
                 actions, result = self._ensure_expert_model_loaded().predict_action_batch(
                     env_obs=env_obs,
@@ -621,11 +541,35 @@ class MultiStepRolloutWorker(Worker):
                     dtype=torch.bool,
                     device=actions.device,
                 )
-                if "rl_phase" not in forward_inputs:
+                if "student_control" not in forward_inputs:
                     batch_size = actions.shape[0]
-                    forward_inputs["rl_phase"] = torch.ones(
+                    forward_inputs["student_control"] = torch.full(
+                        (batch_size, 1),
+                        ready_for_online,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                if "intervention_requested" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["intervention_requested"] = torch.zeros(
                         (batch_size, 1),
                         dtype=torch.bool,
+                        device=actions.device,
+                    )
+                if "ready_for_online" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["ready_for_online"] = torch.full(
+                        (batch_size, 1),
+                        ready_for_online,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                if "online_gate_step" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["online_gate_step"] = torch.full(
+                        (batch_size, 1),
+                        float(online_gate_step),
+                        dtype=torch.float32,
                         device=actions.device,
                     )
                 if self.intervention_success_baseline is not None:

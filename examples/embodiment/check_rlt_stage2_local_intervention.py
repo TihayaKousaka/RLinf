@@ -28,13 +28,6 @@ def _make_worker() -> EnvWorker:
         {
             "algorithm": {
                 "loss_type": "rlt_td3",
-                "rlt_phase": {
-                    "enable": True,
-                    "near_hole_x_min": -0.05,
-                    "near_hole_yz_margin": 1.5,
-                    "exit_hole_x_min": -0.12,
-                    "fallback_hole_radius": 0.035,
-                },
                 "intervention": {
                     "enable": True,
                     "deviation_patience": 2,
@@ -105,12 +98,12 @@ def main() -> None:
     worker = _make_worker()
 
     policy_info = _update(worker, hole_x=-0.20)
-    assert not _flag(policy_info, "rl_phase")
+    assert not _flag(policy_info, "deviation")
     assert not _flag(policy_info, "expert_takeover")
 
     policy_info = _update(worker, hole_x=-0.04)
-    assert _flag(policy_info, "rl_phase")
-    assert _flag(policy_info, "rl_phase_entry")
+    assert not _flag(policy_info, "deviation")
+    assert _scalar(policy_info, "deviation_count") == 0.0
     assert not _flag(policy_info, "expert_takeover")
 
     policy_info = _update(worker, hole_x=-0.04)
@@ -131,7 +124,7 @@ def main() -> None:
     assert _scalar(policy_info, "takeover_used") == 0.0
 
     policy_info = _update(worker, hole_x=-0.04, done=True)
-    assert not _flag(policy_info, "rl_phase")
+    assert not _flag(policy_info, "deviation")
     assert not _flag(policy_info, "expert_takeover")
 
     print("RLT Stage2 local intervention smoke check passed.")

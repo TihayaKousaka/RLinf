@@ -90,19 +90,8 @@ algorithm:
   actor_loss_warmup_updates: 20000
   actor_loss_ramp_updates: 20000
   target_update_freq: 1
-  rlt_phase:
-    # rlt_phase 只管“哪些 chunk 走 Stage2/control/replay”，不管 expert 接管。
-    # enable=False：完全不使用本块阈值，Stage2 默认 full-task，整条任务都进 replay/control。
-    # 这不是关闭 Stage2；Stage2 由 loss_type=rlt_td3 + model_type=rlt_stage2 决定。
-    # enable=True：启用局部 phase，只在接近孔口、抓稳且未成功时让 Stage2 接管。
-    enable: False
-    # 以下参数只在 enable=True 时生效；enable=False 时全部忽略。
-    near_hole_x_min: -0.05
-    near_hole_yz_margin: 1.5
-    exit_hole_x_min: -0.12
-    fallback_hole_radius: 0.035
   intervention:
-    # intervention 独立于 rlt_phase：无论 full-task 还是局部 phase，都可启用 expert/human 纠偏。
+    # intervention 只负责 expert/human 纠偏，不再参与 Stage2 control/replay 划分。
     # enable=True：允许 env 根据下面的偏离检测请求 expert 接管。
     # warmup 阶段仍强制不执行 expert；只有 ready_for_online=True 后才会真的接管。
     enable: True
@@ -122,7 +111,7 @@ algorithm:
     yz_error_eps: 0.01
     # expert 偏离检测开始的 x 门槛，单位 m，相对孔口坐标。
     near_hole_x_min: -0.02
-    # expert 可纠偏区的 y/z 半径倍数；只影响 expert，不影响 Stage2 replay/control。
+    # expert 可纠偏区的 y/z 半径倍数；只影响 expert 纠偏触发区。
     near_hole_yz_margin: 1.5
     # 已进入 expert 可纠偏区后，x 退到该阈值外就退出局部偏离检测。
     exit_hole_x_min: -0.12
@@ -153,13 +142,13 @@ env:
   group_name: "EnvGroup"
   train:
     # 并行训练环境数；越大 rollout 数据越多，但仿真/显存/CPU 压力越高。
-    total_num_envs: 32
+    total_num_envs: 64
     # Train seed 只影响训练初始状态随机序列；eval 仍固定，方便 checkpoint 间比较。
     seed: 20260604
-    # True 表示 episode done 后自动 reset；train env/success_once 只统计已 done episode。
-    auto_reset: True
+    # False 对齐 openpi-RLT：episode done 后本轮 rollout 内冻结，下一轮显式 reset。
+    auto_reset: False
     ignore_terminations: False
-    # Train 不固定 reset ids，会受 seed 和 auto-reset 影响；eval 固定，更适合看真实性能。
+    # Train 不固定 reset ids，会受 seed 影响；eval 固定，更适合看真实性能。
     use_fixed_reset_state_ids: False
     # RLT joint-control 观测包装：图像 + joint proprio + prompt。
     wrap_obs_mode: rlt_openpi_joint
@@ -182,8 +171,11 @@ env:
         height: 384
   eval:
     # Eval 环境数；eval/success_once 比 train env/success_once 更可信。
-    total_num_envs: 32
-    auto_reset: True
+    total_num_envs: 256
+    # Eval 固定一批非默认 seed 生成的 reset ids，避免隐式使用 seed=0 的偏简单题集。
+    seed: 20260604
+    # False 对齐 train/openpi-RLT：单批 eval episode done 后不自动重开新 episode。
+    auto_reset: False
     ignore_terminations: False
     # 固定 reset ids，保证不同 checkpoint 评估口径一致。
     use_fixed_reset_state_ids: True
@@ -288,8 +280,8 @@ actor:
       warmup_q_weight: 0.05
       # actor loss ramp 结束后的 online 权重：
       # actor_loss = online_bc_weight * BC_loss - online_q_weight * Q + delta_weight * delta_loss。
-      online_bc_weight: 3.5
-      online_q_weight: 0.1
+      online_bc_weight: 2.9
+      online_q_weight: 0.15
       # chunk 内动作差分正则；0 表示不启用。
       delta_weight: 0.0
       # TD3 常用设置：2 次 critic update 对 1 次 actor update。
