@@ -16,7 +16,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    # Actor worker 负责训练 residual actor 和 critic；这里固定放在 rank 0。
+    # Actor worker 负责训练 direct actor 和 critic；这里固定放在 rank 0。
     actor: 0-0
     # Env/Rollout 用 all 是为了最大化并行 rollout；如果显存紧张，可手动拆 rank。
     env: all
@@ -54,16 +54,16 @@ algorithm:
   update_epoch: 5
   # 每个 runner global step 最多实际执行多少次 critic update。
   # 不改变总训练预算，只是把 pending_update_budget 分摊到多个 step；0 表示不限制。
-  max_updates_per_train_step: 600
+  max_updates_per_train_step: 800
   # Replay 最少攒多少条 action-chunk transition 后才允许训练。
   # 这里的 1 条 transition 是 1 个 10-step action chunk，不是 1 个 env step，
   # 也不是 1 个 episode；它只是最低门槛，不负责主要训练节奏。
-  warmup_min_size: 600
+  warmup_min_size: 1000
   # Stage2 actor 上线前，learner 至少要补齐多少次 critic update。
   # 单位是 critic update，不是 runner global step，也不是 episode。
-  # replay 满 600 后会先锁定这 20000 次 warmup update；补完前 train/eval 仍执行 base VLA，
+  # replay 满 1000 后会先锁定这 30000 次 warmup update；补完前 train/eval 仍执行 base VLA，
   # 但 actor/critic 会在后台持续训练。
-  warmup_post_collect_updates: 20000
+  warmup_post_collect_updates: 30000
   # 设 0 表示不按 episode 节奏触发训练；full-task 下 episode 长短会让训练节奏抖动。
   train_every_episodes: 0
   # 这里的 1 不是 batch size，而是在线训练周期的最小 transition 间隔。
@@ -91,7 +91,7 @@ algorithm:
   # 0-20000 update：使用 warmup_bc/q；20000-50000 update：线性切到 online_bc/q；
   # >=20000 update：actor 才 ready_for_online，上线控制环境。
   actor_loss_warmup_updates: 20000
-  actor_loss_ramp_updates: 20000
+  actor_loss_ramp_updates: 50000
   target_update_freq: 1
   intervention:
     # intervention 只负责 expert/human 纠偏，不再参与 Stage2 control/replay 划分。
@@ -100,22 +100,30 @@ algorithm:
     enable: True
     mode: local_correction
     # local_correction：连续检测到偏离后，请 expert 接管若干个 action chunk。
-    # deviation_patience 单位是 action chunk，3 表示连续 3 个 10-step chunk 偏离才触发。
-    deviation_patience: 3
+    # deviation_patience 单位是 action chunk；2 表示连续 2 个 10-step chunk 偏离就触发，
+    # 比 3 更早介入，能增加 expert 纠偏样本。
+    deviation_patience: 2
     # 触发后至少接管多少个 action chunk；一个 chunk = 10 个 env control step。
+    # 这里保持 3，避免 expert 只接一小段还没把轨迹拉回安全区就退出。
     takeover_chunks: 3
     # 如果还没恢复安全状态，最多连续接管多少个 action chunk。
-    takeover_max_chunks: 5
-    # y/z 安全范围倍数，乘以当前 widened hole radius；越大越宽松、expert 越少介入。
-    safe_yz_margin: 2.0
+    # 从 5 放到 6，给 expert 多一个 chunk 修正空间，但仍避免整段都由 expert 控制。
+    takeover_max_chunks: 6
+    # y/z 安全范围倍数，乘以当前 widened hole radius；越小越严格、expert 越容易介入。
+    # 1.5 比 2.0 更敏感：靠近孔但 y/z 偏得明显时更早认为不安全。
+    safe_yz_margin: 1.5
     # x 插入进展阈值，单位 m/chunk；小于该进展视为没有向孔内推进。
+    # 0.01 表示一个 10-step chunk 内至少推进 1cm，否则视为停滞。
     progress_eps: 0.01
     # y/z 误差恶化阈值，单位 m/chunk；超过该增量视为对孔变差。
-    yz_error_eps: 0.01
+    # 从 0.01 降到 0.005，让横向/竖向偏离变差 5mm 就能累计 deviation。
+    yz_error_eps: 0.005
     # expert 偏离检测开始的 x 门槛，单位 m，相对孔口坐标。
-    near_hole_x_min: -0.02
+    # 从 -0.02 提前到 -0.06：更早进入“可能需要纠偏”的插入前区域。
+    near_hole_x_min: -0.06
     # expert 可纠偏区的 y/z 半径倍数；只影响 expert 纠偏触发区。
-    near_hole_yz_margin: 1.5
+    # 从 1.5 放宽到 2.0，让偏得稍远但仍可由 expert 拉回的样本也进入检测。
+    near_hole_yz_margin: 2.0
     # 已进入 expert 可纠偏区后，x 退到该阈值外就退出局部偏离检测。
     exit_hole_x_min: -0.12
     # 如果 env 没暴露 widened hole 半径，用这个半径做 expert 偏离检测，单位 m。
@@ -176,7 +184,7 @@ env:
     # Eval 环境数；eval/success_once 比 train env/success_once 更可信。
     total_num_envs: 256
     # Eval 固定一批非默认 seed 生成的 reset ids，避免隐式使用 seed=0 的偏简单题集。
-    seed: 20260604
+    seed: 2026
     # False 对齐 train/openpi-RLT：单批 eval episode done 后不自动重开新 episode。
     auto_reset: False
     ignore_terminations: False
@@ -190,7 +198,7 @@ env:
     action_exec_chunks: 10
     group_size: 1
     video_cfg:
-      save_video: True
+      save_video: False
       fps: 10
       record_every: 1
       video_base_dir: ${runner.logger.log_path}/video/eval
@@ -222,7 +230,7 @@ rollout:
     # 强 expert，用来模拟 human intervention。
     model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_8000/actor"
     precision: null
-    # True 表示 expert 只作为 VLA reference action，不加载/使用 Stage2 actor residual。
+    # True 表示 expert 只作为 VLA reference action，不加载/使用 Stage2 actor。
     act_as_vla_reference: True
   enable_torch_compile: False
   enable_cuda_graph: False
@@ -237,8 +245,8 @@ actor:
   seed: 1234
   enable_offload: False
   model:
-    # 学生/base VLA checkpoint。Stage2 actor 在它的 reference action 附近学习 residual。
-    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor"
+    # 学生/base VLA checkpoint。Stage2 actor 以它的 reference action 为条件直接输出 action chunk。
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260531-16:37:53/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_1000/actor"
     precision: null
     load_to_device: True
     # 一次输出 10 个动作，每个 joint action 8 维。
@@ -252,7 +260,7 @@ actor:
       # 与学生/base VLA 对齐的数据归一化统计。
       norm_stats_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/maniskill_peginsertionside_joint/norm_stats.json"
       # Stage1 训练出的 RL token checkpoint。
-      rl_token_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260603-19:39:20/rlt_stage1_maniskill_joint/checkpoints/global_step_3000/actor/rl_token/rl_token_model.pt"
+      rl_token_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260603-23:07:52/rlt_stage1_maniskill_joint/checkpoints/global_step_5000/actor/rl_token/rl_token_model.pt"
       # 使用主视角 + wrist 视角。
       num_images_in_input: 2
       # joint proprio 维度；x = [z_rl, proprio]。
@@ -263,19 +271,15 @@ actor:
       encoder_heads: 8
       decoder_layers: 2
       decoder_heads: 8
-      # residual actor 和 twin-Q critic 的 MLP 宽度/层数。
+      # direct Gaussian actor 和 twin-Q critic 的 MLP 宽度/层数。
       mlp_hidden_dim: 256
       mlp_num_hidden_layers: 2
-      # Online rollout 时给 Stage2 actor 动作加的探索噪声。
-      # 越大探索越强，也越容易破坏 base VLA 已经会做的动作。
+      # RLT actor 的 fixed Gaussian std；train rollout/actor loss/TD target 会采样，
+      # eval 使用 actor mean。越大探索越强，也越容易破坏 base VLA 附近动作。
       actor_noise_sigma: 0.002
       # 训练 actor 时随机把一部分 a_tilde 输入置零。
       # 作用是逼 actor 也利用 RL token/state，不要只学复制 base VLA reference。
       ref_action_dropout: 0.5
-      # TD3 target policy smoothing：算 critic target 时给 next action 加小噪声。
-      # sigma 是噪声标准差，clip 是噪声最大绝对值。
-      target_noise_sigma: 0.05
-      target_noise_clip: 0.1
       # BC regularizer 的默认权重；如果没有显式 warmup/online 权重会用它。
       bc_regularizer_beta: 3.0
       # actor loss warmup 阶段使用：高 BC、低 Q，让 actor 先贴近 base VLA 的 a_tilde。
@@ -283,8 +287,8 @@ actor:
       warmup_q_weight: 0.05
       # actor loss ramp 结束后的 online 权重：
       # actor_loss = online_bc_weight * BC_loss - online_q_weight * Q + delta_weight * delta_loss。
-      online_bc_weight: 2.9
-      online_q_weight: 0.15
+      online_bc_weight: 2.75
+      online_q_weight: 0.18
       # chunk 内动作差分正则；0 表示不启用。
       delta_weight: 0.0
       # TD3 常用设置：2 次 critic update 对 1 次 actor update。
@@ -296,15 +300,15 @@ actor:
       gamma: 0.99
 
   optim:
-    # actor optimizer；lr 太大容易让 residual 很快偏离 base VLA。
+    # actor optimizer；lr 太大容易让 action 很快偏离 base VLA reference。
     clip_grad: 10.0
-    lr: 3.0e-5
+    lr: 1.0e-4
     lr_scheduler: torch_constant
 
   critic_optim:
     # critic optimizer；critic 不稳时 actor 会被错误 Q 方向带偏。
     clip_grad: 10.0
-    lr: 3.0e-5
+    lr: 1.0e-4
     lr_scheduler: torch_constant
 
   fsdp_config:

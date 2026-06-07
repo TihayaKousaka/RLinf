@@ -296,10 +296,15 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 done_idx = min(t + 1, dones_all.shape[0] - 1)
                 env_done = float(dones_all[done_idx, env_idx].any().item())
                 done = float(env_done > 0.0)
-                intervention = 0.0
+                intervention_mask: float | np.ndarray = 0.0
                 if intervention_flags_all is not None:
-                    intervention = float(
-                        intervention_flags_all[t, env_idx].detach().float().mean().item()
+                    intervention_mask = (
+                        intervention_flags_all[t, env_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32, copy=False)
+                        .reshape(-1)
                     )
 
                 x = x_all[t, env_idx].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -374,7 +379,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     next_x=next_x,
                     next_a_tilde=next_a_tilde,
                     done=done,
-                    intervention=intervention,
+                    intervention=intervention_mask,
                 )
                 added += 1
                 if env_done > 0.0:
@@ -698,7 +703,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         if update_actor:
             actor_losses = []
             actor_q_values = []
-            actor_residual_abs = []
+            actor_action_ref_abs = []
             actor_bc_losses = []
             self.optimizer.zero_grad()
             self.model.set_online_critic_requires_grad(False)
@@ -712,14 +717,14 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         actions = self.model.actor_forward(
                             batch["x"].to(torch.float32),
                             batch["a_tilde"].to(torch.float32),
-                            deterministic=True,
+                            deterministic=False,
                             apply_ref_dropout=bool(
                                 stage2_cfg.get("ref_action_dropout", 0.0) > 0.0
                             ),
-                            apply_action_noise=False,
+                            apply_action_noise=True,
                         )
                         a_tilde_flat = batch["a_tilde"].to(torch.float32)
-                        residual = actions - a_tilde_flat
+                        action_ref_delta = actions - a_tilde_flat
                         chunk_len = int(self.cfg.actor.model.num_action_chunks)
                         action_dim = int(self.cfg.actor.model.action_dim)
                         actions_chunk = actions.reshape(-1, chunk_len, action_dim)
@@ -740,7 +745,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     self.grad_scaler.scale(loss).backward()
                 actor_losses.append(loss.detach().float().item() * self.gradient_accumulation)
                 actor_q_values.append(q_value.detach().float().mean().item())
-                actor_residual_abs.append(residual.detach().float().abs().mean().item())
+                actor_action_ref_abs.append(
+                    action_ref_delta.detach().float().abs().mean().item()
+                )
                 actor_bc_losses.append(
                     float(actor_loss_metrics["bc_loss"].float().item())
                 )
@@ -759,7 +766,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/q_mean": float(np.mean(actor_q_values)),
                     "actor/grad_norm": float(actor_grad_norm),
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
-                    "actor/residual_abs_mean": float(np.mean(actor_residual_abs)),
+                    "actor/action_ref_abs_mean": float(np.mean(actor_action_ref_abs)),
                     "actor/bc_weight": bc_weight,
                     "actor/q_weight": q_weight,
                     "actor/bc_loss": float(np.mean(actor_bc_losses)),
