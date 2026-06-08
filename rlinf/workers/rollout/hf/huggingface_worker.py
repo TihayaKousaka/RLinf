@@ -666,6 +666,9 @@ class MultiStepRolloutWorker(Worker):
                     env_output["obs"],
                     policy_info=env_output.get("policy_info", None),
                 )
+                rlt_step_trace = self._encode_rlt_step_trace(
+                    env_output.get("step_obs", None)
+                )
 
                 save_flags = result.get("forward_inputs", {}).get(
                     "intervention_flags", None
@@ -689,6 +692,7 @@ class MultiStepRolloutWorker(Worker):
                         env_output.get("final_obs", None)
                     ),
                     save_flags=save_flags,
+                    rlt_step_trace=rlt_step_trace,
                     forward_inputs=result["forward_inputs"],
                     versions=torch.full_like(
                         result["prev_logprobs"],
@@ -704,6 +708,9 @@ class MultiStepRolloutWorker(Worker):
                 allow_expert=False,
                 policy_info=env_output.get("policy_info", None),
             )
+            rlt_step_trace = self._encode_rlt_step_trace(
+                env_output.get("step_obs", None)
+            )
 
             forward_inputs = (
                 result["forward_inputs"] if self._is_rlt_stage2_td3() else {}
@@ -714,6 +721,7 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=self.get_bootstrap_values(
                     env_output.get("final_obs", None)
                 ),
+                rlt_step_trace=rlt_step_trace,
                 forward_inputs=forward_inputs,
             )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
@@ -827,6 +835,169 @@ class MultiStepRolloutWorker(Worker):
             return list(np.split(actions, split_indices, axis=0))
         return list(torch.split(actions, sizes, dim=0))
 
+    def _flatten_step_obs(self, step_obs: dict[str, Any]) -> tuple[dict[str, Any], int, int]:
+        first_tensor = next(
+            (
+                value
+                for key, value in step_obs.items()
+                if not key.startswith("_rlt_")
+                if isinstance(value, torch.Tensor)
+            ),
+            None,
+        )
+        if first_tensor is None:
+            raise ValueError("RLT step_obs must contain at least one tensor field.")
+        step_count = int(first_tensor.shape[0])
+        batch_size = int(first_tensor.shape[1])
+        flat_obs: dict[str, Any] = {}
+        for key, value in step_obs.items():
+            if key.startswith("_rlt_"):
+                continue
+            if isinstance(value, torch.Tensor):
+                flat_obs[key] = value.reshape(step_count * batch_size, *value.shape[2:])
+            elif isinstance(value, list):
+                flat_obs[key] = [
+                    item
+                    for step_values in value
+                    for item in step_values
+                ]
+            elif value is None:
+                flat_obs[key] = None
+            else:
+                flat_obs[key] = value
+        return flat_obs, step_count, batch_size
+
+    def _rlt_sparse_anchor_offsets(self, step_count: int) -> list[int]:
+        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
+        if stride <= 0 or chunk_len <= 0:
+            return []
+
+        # Boundaries are already cached in forward_inputs on the actor side.
+        # Only encode non-boundary offsets that can become stride-window starts.
+        offsets = set()
+        offset = 0
+        while True:
+            offset = (offset + stride) % chunk_len
+            if offset == 0 or offset in offsets:
+                break
+            if offset < step_count:
+                offsets.add(offset)
+        return sorted(offsets)
+
+    @staticmethod
+    def _slice_step_obs_offsets(
+        step_obs: dict[str, Any],
+        offsets: list[int],
+    ) -> dict[str, Any]:
+        sliced_obs: dict[str, Any] = {}
+        index_tensor = torch.as_tensor(offsets, dtype=torch.long)
+        for key, value in step_obs.items():
+            if key.startswith("_rlt_"):
+                continue
+            if isinstance(value, torch.Tensor):
+                sliced_obs[key] = value.index_select(
+                    0, index_tensor.to(device=value.device)
+                )
+            elif isinstance(value, list):
+                sliced_obs[key] = [value[offset] for offset in offsets]
+            elif value is None:
+                sliced_obs[key] = None
+            else:
+                sliced_obs[key] = value
+        return sliced_obs
+
+    @staticmethod
+    def _slice_flat_obs(
+        flat_obs: dict[str, Any],
+        begin: int,
+        end: int,
+    ) -> dict[str, Any]:
+        obs_chunk: dict[str, Any] = {}
+        for key, value in flat_obs.items():
+            if isinstance(value, torch.Tensor):
+                obs_chunk[key] = value[begin:end]
+            elif isinstance(value, list):
+                obs_chunk[key] = value[begin:end]
+            else:
+                obs_chunk[key] = value
+        return obs_chunk
+
+    def _encode_rlt_step_trace(
+        self,
+        step_obs: dict[str, Any] | None,
+    ) -> dict[str, torch.Tensor]:
+        if step_obs is None or not self._is_rlt_stage2_td3():
+            return {}
+        if not hasattr(self.hf_model, "encode_obs"):
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires hf_model.encode_obs for step features."
+            )
+        first_tensor = next(
+            (
+                value
+                for key, value in step_obs.items()
+                if not key.startswith("_rlt_")
+                if isinstance(value, torch.Tensor)
+            ),
+            None,
+        )
+        explicit_offsets = step_obs.get("_rlt_step_offsets", None)
+        if explicit_offsets is not None:
+            if not isinstance(explicit_offsets, torch.Tensor) or explicit_offsets.dim() != 2:
+                raise ValueError(
+                    "RLT step_obs['_rlt_step_offsets'] must have shape [A, B], "
+                    f"got {type(explicit_offsets)=}."
+                )
+            anchor_offset_tensor = explicit_offsets.to(torch.long).contiguous()
+        else:
+            if first_tensor is None:
+                raise ValueError("RLT step_obs must contain at least one tensor field.")
+            step_count = int(first_tensor.shape[0])
+            batch_size = int(first_tensor.shape[1])
+            anchor_offsets = self._rlt_sparse_anchor_offsets(step_count)
+            anchor_offset_tensor = torch.tensor(
+                anchor_offsets,
+                dtype=torch.long,
+            )[:, None].expand(len(anchor_offsets), batch_size).contiguous()
+            if anchor_offsets:
+                step_obs = self._slice_step_obs_offsets(step_obs, anchor_offsets)
+
+        if anchor_offset_tensor.shape[0] == 0:
+            return {
+                "anchor_offsets": anchor_offset_tensor,
+            }
+
+        if first_tensor is None:
+            raise ValueError("RLT step_obs must contain obs tensors for sparse anchors.")
+        flat_obs, step_count, batch_size = self._flatten_step_obs(step_obs)
+        total = step_count * batch_size
+        micro_batch_size = int(
+            self.cfg.actor.model.rlt_stage2.get("replay_feature_batch_size", 32)
+        )
+        if micro_batch_size <= 0:
+            micro_batch_size = total
+        encoded_x = []
+        encoded_a_tilde = []
+        with torch.no_grad():
+            for begin in range(0, total, micro_batch_size):
+                end = min(begin + micro_batch_size, total)
+                obs_chunk = self._slice_flat_obs(flat_obs, begin, end)
+                x, a_tilde = self.hf_model.encode_obs(obs_chunk)
+                encoded_x.append(x.detach().cpu())
+                encoded_a_tilde.append(a_tilde.detach().cpu())
+        x_all = torch.cat(encoded_x, dim=0).reshape(step_count, batch_size, -1)
+        a_tilde_all = torch.cat(encoded_a_tilde, dim=0).reshape(
+            step_count,
+            batch_size,
+            -1,
+        )
+        return {
+            "anchor_offsets": anchor_offset_tensor,
+            "x": x_all.contiguous(),
+            "a_tilde": a_tilde_all.contiguous(),
+        }
+
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
         obs = obs_batch["obs"] if "obs" in obs_batch else obs_batch
@@ -847,6 +1018,7 @@ class MultiStepRolloutWorker(Worker):
             for obs_batch in obs_batches
         ]
         final_obs_list = [obs_batch.get("final_obs", None) for obs_batch in obs_batches]
+        step_obs_list = [obs_batch.get("step_obs", None) for obs_batch in obs_batches]
         policy_info_list = [obs_batch.get("policy_info", None) for obs_batch in obs_batches]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -874,6 +1046,32 @@ class MultiStepRolloutWorker(Worker):
                 for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
+
+        merged_step_obs = None
+        if any(step_obs is not None for step_obs in step_obs_list):
+            if any(step_obs is None for step_obs in step_obs_list):
+                raise ValueError(
+                    "Inconsistent RLT step_obs: some env shards are None while others are present."
+                )
+            assert step_obs_list[0] is not None
+            merged_step_obs = {}
+            for key in step_obs_list[0].keys():
+                values = [step_obs[key] for step_obs in step_obs_list]
+                first_non_none = next(
+                    (value for value in values if value is not None), None
+                )
+                if first_non_none is None:
+                    merged_step_obs[key] = None
+                elif isinstance(first_non_none, torch.Tensor):
+                    # step_obs is time-major [T, B, ...], merge env shards on B.
+                    merged_step_obs[key] = torch.cat(values, dim=1)
+                elif isinstance(first_non_none, list):
+                    merged_step_obs[key] = [
+                        [item for value in values for item in value[t]]
+                        for t in range(len(first_non_none))
+                    ]
+                else:
+                    merged_step_obs[key] = values
 
         merged_policy_info = None
         if any(policy_info is not None for policy_info in policy_info_list):
@@ -912,6 +1110,7 @@ class MultiStepRolloutWorker(Worker):
         return {
             "obs": merged_obs,
             "final_obs": merged_final_obs,
+            "step_obs": merged_step_obs,
             "policy_info": merged_policy_info,
         }
 
@@ -974,6 +1173,17 @@ class MultiStepRolloutWorker(Worker):
                 for idx in range(len(sizes))
             ]
         )
+        split_rlt_step_trace = (
+            [{} for _ in sizes]
+            if not rollout_result.rlt_step_trace
+            else [
+                {
+                    key: torch.split(value, sizes, dim=1)[idx]
+                    for key, value in rollout_result.rlt_step_trace.items()
+                }
+                for idx in range(len(sizes))
+            ]
+        )
 
         return [
             RolloutResult(
@@ -983,6 +1193,7 @@ class MultiStepRolloutWorker(Worker):
                 bootstrap_values=split_bootstrap_values[idx],
                 save_flags=split_save_flags[idx],
                 forward_inputs=split_forward_inputs[idx],
+                rlt_step_trace=split_rlt_step_trace[idx],
                 versions=split_versions[idx],
             )
             for idx in range(len(sizes))

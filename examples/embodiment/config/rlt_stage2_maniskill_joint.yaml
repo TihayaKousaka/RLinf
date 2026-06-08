@@ -41,7 +41,7 @@ runner:
   val_check_interval: 50
   # 训练开始前先在 step=0 跑一次 eval，记录初始 base/student policy 的真实性能。
   # 这次 eval 不收 replay、不训练，只提供和后续 checkpoint 可比的 baseline。
-  eval_before_train: True
+  eval_before_train: False
   save_interval: 50
   resume_dir: null
   ckpt_path: null
@@ -54,7 +54,7 @@ algorithm:
   update_epoch: 5
   # 每个 runner global step 最多实际执行多少次 critic update。
   # 不改变总训练预算，只是把 pending_update_budget 分摊到多个 step；0 表示不限制。
-  max_updates_per_train_step: 800
+  max_updates_per_train_step: 1600
   # Replay 最少攒多少条 action-chunk transition 后才允许训练。
   # 这里的 1 条 transition 是 1 个 10-step action chunk，不是 1 个 env step，
   # 也不是 1 个 episode；它只是最低门槛，不负责主要训练节奏。
@@ -66,10 +66,10 @@ algorithm:
   warmup_post_collect_updates: 30000
   # 设 0 表示不按 episode 节奏触发训练；full-task 下 episode 长短会让训练节奏抖动。
   train_every_episodes: 0
-  # 这里的 1 不是 batch size，而是在线训练周期的最小 transition 间隔。
-  # 设为 1 表示每新增 1 条 replay transition，就新增 1 个训练周期预算；
+  # 这里的 10 不是 batch size，而是在线训练周期的最小 transition 间隔。
+  # 设为 10 表示每新增 10 条 replay transition，就新增 1 个训练周期预算；
   # 每个周期补 update_epoch=5 次 critic update。
-  train_every_transitions: 1
+  train_every_transitions: 50
   group_size: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
@@ -287,12 +287,22 @@ actor:
       warmup_q_weight: 0.05
       # actor loss ramp 结束后的 online 权重：
       # actor_loss = online_bc_weight * BC_loss - online_q_weight * Q + delta_weight * delta_loss。
-      online_bc_weight: 2.75
-      online_q_weight: 0.18
+      online_bc_weight: 2.8
+      online_q_weight: 0.16
       # chunk 内动作差分正则；0 表示不启用。
       delta_weight: 0.0
       # TD3 常用设置：2 次 critic update 对 1 次 actor update。
       critic_updates_per_actor: 2
+      # 按论文从 step-level trace 里用 stride=2 滑窗构造 replay chunk：
+      # action/reward 来自真实执行的 control-step 序列；
+      # chunk 边界 x/a_tilde 复用正常 policy forward 的 cache；
+      # 非边界 stride anchor 才用冻结 VLA+RL token 编码，避免 rollout 端全量重算。
+      # 设 0 可回退到旧的 chunk-boundary replay 构造。
+      replay_subsample_stride: 2
+      # 只允许 terminal partial chunk；非 terminal rollout 边界不会 padding 造假 transition。
+      replay_allow_terminal_partial: True
+      # 重新编码 step-level obs 的 micro batch size；太大会增加 rollout 显存峰值。
+      replay_feature_batch_size: 32
       # Stage2 自定义 numpy replay buffer 容量；只存 x/action/reward/a_tilde，不存图像。
       # 满了会循环覆盖旧数据；容量越小，近期数据占比越高。
       buffer_capacity: 50000
@@ -302,13 +312,13 @@ actor:
   optim:
     # actor optimizer；lr 太大容易让 action 很快偏离 base VLA reference。
     clip_grad: 10.0
-    lr: 1.0e-4
+    lr: 5.0e-5
     lr_scheduler: torch_constant
 
   critic_optim:
     # critic optimizer；critic 不稳时 actor 会被错误 Q 方向带偏。
     clip_grad: 10.0
-    lr: 1.0e-4
+    lr: 5.0e-5
     lr_scheduler: torch_constant
 
   fsdp_config:

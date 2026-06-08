@@ -10,6 +10,12 @@ This document provides a comprehensive guide to launching and managing the
 Vision-Language-Action Models (VLAs) training task within the RLinf framework, 
 focusing on finetuning a VLA model for robotic manipulation in the ManiSkill3 environment. 
 
+.. note::
+
+   If you are looking for the **joint-control RLT** pipeline with ManiSkill data collection,
+   Stage1 RL token training, and Stage2 online TD3, see
+   :doc:`ManiSkill Joint-Control RLT <maniskill_rlt_joint>`.
+
 The primary objective is to develop a model capable of performing robotic manipulation by:
 
 1. **Visual Understanding**: Processing RGB images from the robot's camera.

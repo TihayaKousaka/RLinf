@@ -268,7 +268,311 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad(True)
 
-    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
+    @staticmethod
+    def _to_numpy_float(tensor: torch.Tensor) -> np.ndarray:
+        return tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def _step_trace_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
+        if (
+            self.replay_buffer is None
+            or traj.actions is None
+            or traj.rewards is None
+            or traj.dones is None
+            or not traj.rlt_step_trace
+        ):
+            return 0, 0
+
+        x_boundary = traj.forward_inputs.get("x") if traj.forward_inputs else None
+        a_tilde_boundary = (
+            traj.forward_inputs.get("a_tilde") if traj.forward_inputs else None
+        )
+        if x_boundary is None or a_tilde_boundary is None:
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires chunk-boundary "
+                "forward_inputs['x'] and forward_inputs['a_tilde']; rollout must "
+                "cache policy-call features instead of forcing actor-side VLA encoding."
+            )
+
+        anchor_offsets = traj.rlt_step_trace.get("anchor_offsets")
+        x_trace = traj.rlt_step_trace.get("x")
+        a_tilde_trace = traj.rlt_step_trace.get("a_tilde")
+        if anchor_offsets is None:
+            raise RuntimeError(
+                "RLT Stage2 stride replay requires sparse "
+                "rlt_step_trace['anchor_offsets']; refusing to fall back to "
+                "chunk-boundary replay."
+            )
+
+        chunk_steps = int(traj.actions.shape[0])
+        bsz = int(traj.actions.shape[1])
+        chunk_len = int(self.cfg.actor.model.num_action_chunks)
+        action_dim = int(self.cfg.actor.model.action_dim)
+        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
+        allow_terminal_partial = bool(
+            self.cfg.actor.model.rlt_stage2.get("replay_allow_terminal_partial", True)
+        )
+        if stride <= 0:
+            return 0, 0
+        if x_boundary.shape[0] < chunk_steps + 1:
+            raise ValueError(
+                "RLT stride replay requires one extra final chunk-boundary feature "
+                f"for bootstrapping: expected at least {chunk_steps + 1}, got "
+                f"{x_boundary.shape[0]}."
+            )
+        if x_boundary.shape[1] != bsz or a_tilde_boundary.shape[1] != bsz:
+            raise ValueError(
+                "RLT boundary feature batch mismatch: "
+                f"{x_boundary.shape=}, {a_tilde_boundary.shape=}, expected B={bsz}."
+            )
+        if traj.rewards.shape[0] != chunk_steps:
+            raise ValueError(
+                "RLT step trace/reward length mismatch: "
+                f"{chunk_steps=} but traj.rewards.shape[0]={traj.rewards.shape[0]}."
+            )
+        if anchor_offsets.dim() != 3:
+            raise ValueError(
+                "RLT sparse anchor_offsets must have shape [chunk_steps, A, B], "
+                f"got {anchor_offsets.shape}."
+            )
+        if anchor_offsets.shape[0] != chunk_steps or anchor_offsets.shape[2] != bsz:
+            raise ValueError(
+                "RLT sparse anchor_offsets/action shape mismatch: "
+                f"{anchor_offsets.shape=}, expected chunk_steps={chunk_steps}, B={bsz}."
+            )
+        feature_steps = int(anchor_offsets.shape[1])
+        if feature_steps > 0:
+            if x_trace is None or a_tilde_trace is None:
+                raise RuntimeError(
+                    "RLT sparse anchor trace has non-boundary offsets but is missing "
+                    "rlt_step_trace['x'] or rlt_step_trace['a_tilde']."
+                )
+            if (
+                x_trace.shape[0] != chunk_steps
+                or x_trace.shape[1] != feature_steps
+                or x_trace.shape[2] != bsz
+                or a_tilde_trace.shape[0] != chunk_steps
+                or a_tilde_trace.shape[1] != feature_steps
+                or a_tilde_trace.shape[2] != bsz
+            ):
+                raise ValueError(
+                    "RLT sparse anchor feature shape mismatch: "
+                    f"{x_trace.shape=}, {a_tilde_trace.shape=}, "
+                    f"{anchor_offsets.shape=}."
+                )
+
+        flat_actions = traj.actions.reshape(chunk_steps, bsz, chunk_len, action_dim)
+        flat_rewards = traj.rewards.reshape(chunk_steps, bsz, chunk_len)
+        dones_all = traj.dones
+        if dones_all.shape[0] == chunk_steps + 1:
+            # EmbodiedRolloutResult stores an initial bootstrap done frame.
+            dones_all = dones_all[1:]
+        if dones_all.shape[0] != chunk_steps:
+            raise ValueError(
+                "RLT step trace/done length mismatch: expected dones to have "
+                f"{chunk_steps} or {chunk_steps + 1} chunk steps, got "
+                f"{traj.dones.shape[0]}."
+            )
+        flat_dones = dones_all.reshape(chunk_steps, bsz, chunk_len)
+        intervention_flags_all = traj.intervene_flags
+        if intervention_flags_all is None:
+            flat_interventions = torch.zeros_like(flat_rewards, dtype=torch.bool)
+        else:
+            if intervention_flags_all.shape[0] != chunk_steps:
+                raise ValueError(
+                    "RLT intervention/action length mismatch: "
+                    f"expected {chunk_steps}, got {intervention_flags_all.shape[0]}."
+                )
+            flat_interventions = intervention_flags_all.reshape(
+                chunk_steps,
+                bsz,
+                chunk_len,
+                -1,
+            ).any(dim=-1)
+
+        added = 0
+        completed_episodes = 0
+        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        total_control_steps = chunk_steps * chunk_len
+
+        def get_feature(
+            global_step: int,
+            env_idx: int,
+            *,
+            terminal_fallback: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if global_step < 0 or global_step > total_control_steps:
+                raise RuntimeError(
+                    f"RLT feature lookup out of range: {global_step=} "
+                    f"with {total_control_steps=}."
+                )
+
+            if global_step % chunk_len == 0:
+                boundary_idx = global_step // chunk_len
+                if boundary_idx < x_boundary.shape[0]:
+                    return (
+                        x_boundary[boundary_idx, env_idx],
+                        a_tilde_boundary[boundary_idx, env_idx],
+                    )
+                if terminal_fallback is not None:
+                    return terminal_fallback
+                raise RuntimeError(
+                    "Missing RLT chunk-boundary feature for non-terminal stride "
+                    f"window end: {global_step=}, {boundary_idx=}."
+                )
+
+            chunk_idx = global_step // chunk_len
+            offset = global_step % chunk_len
+            if chunk_idx >= chunk_steps:
+                if terminal_fallback is not None:
+                    return terminal_fallback
+                raise RuntimeError(
+                    "Missing RLT sparse feature beyond rollout chunk range: "
+                    f"{global_step=}, {chunk_idx=}."
+                )
+            if feature_steps > 0 and x_trace is not None and a_tilde_trace is not None:
+                env_offsets = anchor_offsets[chunk_idx, :, env_idx].to(torch.long)
+                match = torch.nonzero(env_offsets == offset, as_tuple=False).reshape(-1)
+                if match.numel() > 0:
+                    pos = int(match[0].item())
+                    return (
+                        x_trace[chunk_idx, pos, env_idx],
+                        a_tilde_trace[chunk_idx, pos, env_idx],
+                    )
+            if terminal_fallback is not None:
+                return terminal_fallback
+            raise RuntimeError(
+                "Missing RLT sparse anchor feature for non-terminal stride window: "
+                f"{global_step=}, {chunk_idx=}, {offset=}, {stride=}, "
+                f"{anchor_offsets.shape=}."
+            )
+
+        for env_idx in range(bsz):
+            env_actions = flat_actions[:, env_idx].reshape(total_control_steps, action_dim)
+            env_rewards = flat_rewards[:, env_idx].reshape(total_control_steps)
+            env_dones = flat_dones[:, env_idx].reshape(total_control_steps)
+            env_interventions = flat_interventions[:, env_idx].reshape(total_control_steps)
+            done_indices = [
+                int(idx.item())
+                for idx in torch.nonzero(env_dones, as_tuple=False).reshape(-1)
+            ]
+            segment_start = 0
+            stop_env = False
+
+            def add_windows_for_segment(
+                segment_start_idx: int,
+                segment_end_idx: int,
+                *,
+                segment_terminal: bool,
+            ) -> None:
+                nonlocal added
+                if segment_end_idx <= segment_start_idx:
+                    return
+
+                for start in range(segment_start_idx, segment_end_idx, stride):
+                    end = start + chunk_len
+                    valid_end = min(end, segment_end_idx)
+                    terminal = bool(
+                        segment_terminal and valid_end == segment_end_idx
+                    )
+                    is_partial = end > segment_end_idx
+                    if is_partial and (not terminal or not allow_terminal_partial):
+                        # Only terminal partial windows are valid; padding a live
+                        # rollout boundary would fabricate future actions/rewards.
+                        continue
+
+                    x_tensor, a_tilde_tensor = get_feature(start, env_idx)
+                    next_x_tensor, next_a_tilde_tensor = get_feature(
+                        valid_end,
+                        env_idx,
+                        terminal_fallback=(
+                            (x_tensor, a_tilde_tensor) if terminal else None
+                        ),
+                    )
+
+                    x = self._to_numpy_float(x_tensor)
+                    a_tilde = self._to_numpy_float(a_tilde_tensor)
+                    next_x = self._to_numpy_float(next_x_tensor)
+                    next_a_tilde = self._to_numpy_float(next_a_tilde_tensor)
+
+                    valid_len = valid_end - start
+                    action_chunk = torch.zeros(
+                        chunk_len,
+                        action_dim,
+                        dtype=env_actions.dtype,
+                        device=env_actions.device,
+                    )
+                    reward_chunk = torch.zeros(
+                        chunk_len,
+                        dtype=env_rewards.dtype,
+                        device=env_rewards.device,
+                    )
+                    intervention_chunk = torch.zeros(
+                        chunk_len,
+                        dtype=env_interventions.dtype,
+                        device=env_interventions.device,
+                    )
+                    action_chunk[:valid_len] = env_actions[start:valid_end]
+                    reward_chunk[:valid_len] = env_rewards[start:valid_end]
+                    intervention_chunk[:valid_len] = env_interventions[start:valid_end]
+
+                    action_np = self._to_numpy_float(action_chunk).reshape(-1)
+                    rewards_np = self._to_numpy_float(reward_chunk)
+                    intervention_np = self._to_numpy_float(intervention_chunk)
+                    if intervention_np.any():
+                        action_for_ref = self._to_numpy_float(action_chunk).reshape(
+                            chunk_len,
+                            action_dim,
+                        )
+                        a_tilde_chunk = a_tilde.reshape(chunk_len, action_dim).copy()
+                        mask = intervention_np.astype(bool)
+                        a_tilde_chunk[mask] = action_for_ref[mask]
+                        a_tilde = a_tilde_chunk.reshape(-1)
+
+                    self.replay_buffer.add(
+                        x=x,
+                        a=action_np,
+                        a_tilde=a_tilde,
+                        rewards=rewards_np,
+                        next_x=next_x,
+                        next_a_tilde=next_a_tilde,
+                        done=float(terminal),
+                        intervention=intervention_np,
+                    )
+                    added += 1
+
+                    if terminal and not auto_reset:
+                        break
+
+            for done_idx in done_indices:
+                episode_end = done_idx + 1
+                if episode_end <= segment_start:
+                    continue
+                add_windows_for_segment(
+                    segment_start,
+                    episode_end,
+                    segment_terminal=True,
+                )
+                completed_episodes += 1
+                if not auto_reset:
+                    stop_env = True
+                    break
+                # A clean new episode is not available until the next action chunk
+                # boundary. Do not treat the post-done tail as replay data.
+                segment_start = min(
+                    total_control_steps,
+                    ((done_idx // chunk_len) + 1) * chunk_len,
+                )
+
+            if not stop_env and segment_start < total_control_steps:
+                add_windows_for_segment(
+                    segment_start,
+                    total_control_steps,
+                    segment_terminal=False,
+                )
+
+        return added, completed_episodes
+
+    def _chunk_trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
         if self.replay_buffer is None or traj.actions is None or not traj.forward_inputs:
             return 0, 0
 
@@ -388,6 +692,17 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         break
 
         return added, completed_episodes
+
+    def _trajectory_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
+        stride = int(self.cfg.actor.model.rlt_stage2.get("replay_subsample_stride", 0))
+        if stride > 0:
+            if not traj.rlt_step_trace:
+                raise RuntimeError(
+                    "RLT Stage2 stride replay is enabled but trajectory has no "
+                    "rlt_step_trace. Refusing to fall back to chunk-boundary replay."
+                )
+            return self._step_trace_to_transitions(traj)
+        return self._chunk_trajectory_to_transitions(traj)
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         clear_memory(sync=False)
