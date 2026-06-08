@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .transition import TransitionSource
+
 
 class MLP(nn.Module):
     """Simple MLP used by the actor and Q networks."""
@@ -225,12 +227,41 @@ def actor_loss(
     a: Tensor,
     a_tilde: Tensor,
     *,
+    action_chunk: Tensor | None = None,
+    source_chunk: Tensor | None = None,
     bc_weight: float,
     q_weight: float,
     delta_weight: float,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    bc_loss = F.mse_loss(a, a_tilde)
-    delta_loss = chunk_delta_loss(a, a_tilde)
+    if action_chunk is None:
+        action_chunk = a_tilde
+    if source_chunk is None:
+        bc_target = a_tilde
+        human_mask = torch.zeros(a.shape[:2], device=a.device, dtype=torch.bool)
+    else:
+        source_chunk = source_chunk.to(device=a.device)
+        human_mask = torch.logical_or(
+            source_chunk == int(TransitionSource.HUMAN),
+            source_chunk == int(TransitionSource.MIXED),
+        )
+        bc_target = torch.where(human_mask[..., None], action_chunk, a_tilde)
+
+    bc_error = (a - bc_target).square().mean(dim=-1)
+    bc_loss = bc_error.mean()
+    ref_error = (a - a_tilde).square().mean(dim=-1)
+    human_error = (a - action_chunk).square().mean(dim=-1)
+    policy_mask = ~human_mask
+    bc_ref_loss = (
+        ref_error[policy_mask].mean()
+        if policy_mask.any()
+        else torch.zeros((), device=a.device, dtype=a.dtype)
+    )
+    bc_human_loss = (
+        human_error[human_mask].mean()
+        if human_mask.any()
+        else torch.zeros((), device=a.device, dtype=a.dtype)
+    )
+    delta_loss = chunk_delta_loss(a, bc_target)
     q_mean = q_value.mean()
     total_loss = (
         bc_weight * bc_loss
@@ -239,7 +270,10 @@ def actor_loss(
     )
     metrics = {
         "bc_loss": bc_loss.detach(),
+        "bc_ref_loss": bc_ref_loss.detach(),
+        "bc_human_loss": bc_human_loss.detach(),
         "delta_loss": delta_loss.detach(),
+        "human_mask_ratio": human_mask.to(torch.float32).mean().detach(),
         "q_mean": q_mean.detach(),
     }
     return total_loss, metrics

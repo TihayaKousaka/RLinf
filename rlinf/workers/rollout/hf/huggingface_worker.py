@@ -28,6 +28,11 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.rlt_stage2.transition import (
+    COLLECTION_PHASE_ONLINE,
+    COLLECTION_PHASE_WARMUP,
+    TransitionSource,
+)
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
@@ -433,6 +438,16 @@ class MultiStepRolloutWorker(Worker):
                     dtype=torch.bool,
                     device=actions.device,
                 )
+                source_chunk = torch.full(
+                    (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                    int(
+                        TransitionSource.RL
+                        if ready_for_online
+                        else TransitionSource.BASE
+                    ),
+                    dtype=torch.uint8,
+                    device=actions.device,
+                )
                 if use_expert:
                     if expert_takeover is None:
                         expert_takeover = torch.zeros_like(student_control)
@@ -451,23 +466,38 @@ class MultiStepRolloutWorker(Worker):
                         )
                     expert_mask = expert_takeover[:, None, None].to(actions.device)
                     actions = torch.where(expert_mask, expert_actions, actions)
-                    expert_flat = expert_actions.reshape(expert_actions.shape[0], -1)
-                    # Algorithm 1: intervention replaces the VLA reference stored in replay.
-                    forward_inputs["a_tilde"] = torch.where(
-                        expert_takeover[:, None].to(base_flat.device),
-                        expert_flat.detach(),
-                        base_flat,
-                    )
                     intervention_flags[expert_takeover] = True
+                    source_chunk[expert_takeover] = int(TransitionSource.HUMAN)
                     expert_label_flag = True
 
                 action_flat = actions.reshape(actions.shape[0], -1)
                 forward_inputs["base_a_tilde"] = base_flat
+                forward_inputs["ref_chunk"] = base_flat.detach()
                 forward_inputs["action"] = action_flat.detach()
+                forward_inputs["action_chunk"] = action_flat.detach()
                 forward_inputs["student_control"] = student_control[:, None].to(
                     actions.device
                 )
                 forward_inputs["intervention_flags"] = intervention_flags
+                forward_inputs["source_chunk"] = source_chunk
+                forward_inputs["source"] = torch.where(
+                    source_chunk.eq(source_chunk[:, :1]).all(dim=1, keepdim=True),
+                    source_chunk[:, :1],
+                    torch.full(
+                        (actions.shape[0], 1),
+                        int(TransitionSource.MIXED),
+                        dtype=torch.uint8,
+                        device=actions.device,
+                    ),
+                )
+                forward_inputs["collection_phase_id"] = torch.full(
+                    (actions.shape[0], 1),
+                    COLLECTION_PHASE_ONLINE
+                    if ready_for_online
+                    else COLLECTION_PHASE_WARMUP,
+                    dtype=torch.uint8,
+                    device=actions.device,
+                )
                 if requested_expert_takeover is None:
                     requested_expert_takeover = torch.zeros_like(student_control)
                 forward_inputs["intervention_requested"] = (
@@ -529,11 +559,53 @@ class MultiStepRolloutWorker(Worker):
                 forward_inputs = result["forward_inputs"]
                 if "a_tilde" in forward_inputs and "base_a_tilde" not in forward_inputs:
                     forward_inputs["base_a_tilde"] = forward_inputs["a_tilde"].detach()
+                if "a_tilde" in forward_inputs and "ref_chunk" not in forward_inputs:
+                    forward_inputs["ref_chunk"] = forward_inputs["a_tilde"].detach()
+                if "action_chunk" not in forward_inputs:
+                    forward_inputs["action_chunk"] = actions.reshape(
+                        actions.shape[0],
+                        -1,
+                    ).detach()
                 if "intervention_flags" not in forward_inputs:
                     batch_size = actions.shape[0]
                     forward_inputs["intervention_flags"] = torch.zeros(
                         (batch_size, self.cfg.actor.model.num_action_chunks),
                         dtype=torch.bool,
+                        device=actions.device,
+                    )
+                if "source_chunk" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    source_value = int(
+                        TransitionSource.RL
+                        if ready_for_online
+                        else TransitionSource.BASE
+                    )
+                    forward_inputs["source_chunk"] = torch.full(
+                        (batch_size, self.cfg.actor.model.num_action_chunks),
+                        source_value,
+                        dtype=torch.uint8,
+                        device=actions.device,
+                    )
+                if "source" not in forward_inputs:
+                    source_chunk = forward_inputs["source_chunk"].to(actions.device)
+                    forward_inputs["source"] = torch.where(
+                        source_chunk.eq(source_chunk[:, :1]).all(dim=1, keepdim=True),
+                        source_chunk[:, :1],
+                        torch.full(
+                            (actions.shape[0], 1),
+                            int(TransitionSource.MIXED),
+                            dtype=torch.uint8,
+                            device=actions.device,
+                        ),
+                    )
+                if "collection_phase_id" not in forward_inputs:
+                    batch_size = actions.shape[0]
+                    forward_inputs["collection_phase_id"] = torch.full(
+                        (batch_size, 1),
+                        COLLECTION_PHASE_ONLINE
+                        if ready_for_online
+                        else COLLECTION_PHASE_WARMUP,
+                        dtype=torch.uint8,
                         device=actions.device,
                     )
                 forward_inputs["intervention_enabled"] = torch.full(

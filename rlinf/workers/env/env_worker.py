@@ -435,6 +435,10 @@ class EnvWorker(Worker):
     def _rlt_stage2_policy_info_enabled(self) -> bool:
         return self._rlt_stage2_intervention_enabled()
 
+    def _rlt_policy_env_type(self, mode: Literal["train", "eval"]) -> str:
+        env_cfg = self.cfg.env.train if mode == "train" else self.cfg.env.eval
+        return str(env_cfg.get("env_type", "")).lower()
+
     def _init_rlt_local_policy_state(
         self, stage_id: int, mode: Literal["train", "eval"] = "train"
     ) -> dict[str, torch.Tensor] | None:
@@ -504,6 +508,121 @@ class EnvWorker(Worker):
             env = env.env
         return getattr(env, "unwrapped", env)
 
+    @staticmethod
+    def _lookup_rlt_policy_info_value(infos: dict[str, Any], key: str) -> Any:
+        if key in infos:
+            return infos[key]
+        policy_info = infos.get("policy_info")
+        if isinstance(policy_info, dict) and key in policy_info:
+            return policy_info[key]
+        final_info = infos.get("final_info")
+        if isinstance(final_info, dict):
+            if key in final_info:
+                return final_info[key]
+            final_policy_info = final_info.get("policy_info")
+            if isinstance(final_policy_info, dict) and key in final_policy_info:
+                return final_policy_info[key]
+        return None
+
+    @staticmethod
+    def _coerce_rlt_bool_info(
+        value: Any,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+        tensor = torch.as_tensor(value, device=device)
+        if tensor.numel() == 1:
+            return torch.full(
+                (batch_size,),
+                bool(tensor.reshape(-1)[0].item()),
+                dtype=torch.bool,
+                device=device,
+            )
+        tensor = tensor.reshape(batch_size, -1)
+        return tensor.to(torch.bool).any(dim=1)
+
+    @staticmethod
+    def _coerce_rlt_int_info(
+        value: Any,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(batch_size, dtype=torch.int64, device=device)
+        tensor = torch.as_tensor(value, device=device)
+        if tensor.numel() == 1:
+            return torch.full(
+                (batch_size,),
+                int(tensor.reshape(-1)[0].item()),
+                dtype=torch.int64,
+                device=device,
+            )
+        tensor = tensor.reshape(batch_size, -1)
+        return tensor[:, -1].to(torch.int64)
+
+    def _update_rlt_generic_policy_state(
+        self,
+        infos: dict[str, Any],
+        chunk_dones: torch.Tensor,
+        stage_id: int,
+        mode: Literal["train", "eval"],
+    ) -> dict[str, torch.Tensor]:
+        states = (
+            self.rlt_local_policy_state
+            if mode == "train"
+            else self.eval_rlt_local_policy_state
+        )
+        state = states[stage_id]
+        device = chunk_dones.device
+        done_any = chunk_dones.any(dim=1).to(device)
+        batch_size = int(done_any.shape[0])
+        for key, value in state.items():
+            state[key] = value.to(device)
+
+        expert_takeover = self._coerce_rlt_bool_info(
+            self._lookup_rlt_policy_info_value(infos, "expert_takeover"),
+            batch_size=batch_size,
+            device=device,
+        )
+        deviation = self._coerce_rlt_bool_info(
+            self._lookup_rlt_policy_info_value(infos, "deviation"),
+            batch_size=batch_size,
+            device=device,
+        )
+        intervention_region = self._coerce_rlt_bool_info(
+            self._lookup_rlt_policy_info_value(infos, "intervention_region"),
+            batch_size=batch_size,
+            device=device,
+        )
+        state["expert_takeover"] = torch.where(
+            done_any,
+            torch.zeros_like(expert_takeover),
+            expert_takeover,
+        )
+        state["deviation"] = torch.where(done_any, torch.zeros_like(deviation), deviation)
+        state["intervention_region"] = torch.where(
+            done_any,
+            torch.zeros_like(intervention_region),
+            intervention_region,
+        )
+        for key in ("deviation_count", "takeover_left", "takeover_used"):
+            state[key] = torch.where(
+                done_any,
+                torch.zeros_like(state[key]),
+                self._coerce_rlt_int_info(
+                    self._lookup_rlt_policy_info_value(infos, key),
+                    batch_size=batch_size,
+                    device=device,
+                ),
+            )
+        state["prev_yz_error"] = torch.full_like(state["prev_yz_error"], float("nan"))
+        state["prev_hole_x"] = torch.full_like(state["prev_hole_x"], float("nan"))
+        return self._export_rlt_local_policy_info(state)
+
     def _update_rlt_local_policy_state(
         self,
         infos: dict[str, Any] | None,
@@ -522,6 +641,14 @@ class EnvWorker(Worker):
             or not states
         ):
             return None
+
+        if self._rlt_policy_env_type(mode) != "maniskill":
+            return self._update_rlt_generic_policy_state(
+                infos,
+                chunk_dones,
+                stage_id,
+                mode,
+            )
 
         required_keys = [
             "consecutive_grasp_current",

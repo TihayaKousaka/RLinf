@@ -29,6 +29,9 @@ from rlinf.utils.nested_dict_process import (
     stack_list_of_dict_tensor,
 )
 
+_RLT_SOURCE_HUMAN = 2
+_RLT_SOURCE_MIXED = 3
+
 
 def get_model_weights_id(versions: torch.Tensor) -> str:
     """
@@ -704,6 +707,7 @@ class EmbodiedRolloutResult:
             assert intervene_flags.dim() == 2, (
                 f"Expected 2D tensor, got {intervene_flags.shape=}"
             )
+            intervene_flags = intervene_flags.to(torch.bool)
 
             bsz, num_action_chunks = intervene_flags.shape[:2]
             flags = intervene_flags.reshape(-1, num_action_chunks, 1)
@@ -722,6 +726,37 @@ class EmbodiedRolloutResult:
                 if "action" in last_fi:
                     last_fi["action"] = (
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
+                    )
+                if "action_chunk" in last_fi:
+                    last_fi["action_chunk"] = (
+                        last_full_action.reshape(bsz, -1).cpu().contiguous()
+                    )
+                if "source_chunk" in last_fi:
+                    source_chunk = last_fi["source_chunk"].clone()
+                    source_chunk = source_chunk.reshape(bsz, num_action_chunks)
+                    source_chunk[intervene_flags.to(source_chunk.device)] = (
+                        _RLT_SOURCE_HUMAN
+                    )
+                    last_fi["source_chunk"] = source_chunk.cpu().contiguous()
+                    last_fi["source"] = torch.where(
+                        source_chunk.eq(source_chunk[:, :1]).all(
+                            dim=1,
+                            keepdim=True,
+                        ),
+                        source_chunk[:, :1],
+                        torch.full(
+                            (bsz, 1),
+                            _RLT_SOURCE_MIXED,
+                            dtype=source_chunk.dtype,
+                            device=source_chunk.device,
+                        ),
+                    ).cpu().contiguous()
+                last_fi["intervention_flag"] = (
+                    intervene_flags.any(dim=1, keepdim=True).cpu().contiguous()
+                )
+                if "intervention_flags" in last_fi:
+                    last_fi["intervention_flags"] = (
+                        intervene_flags.cpu().contiguous()
                     )
                 last_fi.pop("model_action", None)
 

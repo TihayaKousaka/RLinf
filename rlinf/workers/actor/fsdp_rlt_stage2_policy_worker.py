@@ -21,6 +21,10 @@ from rlinf.utils.utils import clear_memory
 
 from ...models.embodiment.rlt_stage2.components import actor_loss, critic_loss
 from ...models.embodiment.rlt_stage2.replay_buffer import RLTStage2ReplayBuffer
+from ...models.embodiment.rlt_stage2.transition import (
+    TransitionSource,
+    resolve_chunk_source,
+)
 
 
 class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
@@ -272,6 +276,10 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
     def _to_numpy_float(tensor: torch.Tensor) -> np.ndarray:
         return tensor.detach().cpu().numpy().astype(np.float32, copy=False)
 
+    @staticmethod
+    def _to_numpy_uint8(tensor: torch.Tensor) -> np.ndarray:
+        return tensor.detach().cpu().numpy().astype(np.uint8, copy=False)
+
     def _step_trace_to_transitions(self, traj: Trajectory) -> tuple[int, int]:
         if (
             self.replay_buffer is None
@@ -388,6 +396,29 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 chunk_len,
                 -1,
             ).any(dim=-1)
+        source_chunk_all = (
+            traj.forward_inputs.get("source_chunk") if traj.forward_inputs else None
+        )
+        if source_chunk_all is None:
+            flat_sources = torch.where(
+                flat_interventions,
+                torch.full_like(flat_interventions, int(TransitionSource.HUMAN), dtype=torch.uint8),
+                torch.full_like(flat_interventions, int(TransitionSource.RL), dtype=torch.uint8),
+            )
+        else:
+            if source_chunk_all.shape[0] < chunk_steps:
+                raise ValueError(
+                    "RLT source_chunk/action length mismatch: "
+                    f"expected at least {chunk_steps}, got {source_chunk_all.shape[0]}."
+                )
+            flat_sources = source_chunk_all[:chunk_steps].reshape(
+                chunk_steps,
+                bsz,
+                chunk_len,
+            ).to(torch.uint8)
+        collection_phase_id_all = (
+            traj.forward_inputs.get("collection_phase_id") if traj.forward_inputs else None
+        )
 
         added = 0
         completed_episodes = 0
@@ -451,6 +482,7 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             env_rewards = flat_rewards[:, env_idx].reshape(total_control_steps)
             env_dones = flat_dones[:, env_idx].reshape(total_control_steps)
             env_interventions = flat_interventions[:, env_idx].reshape(total_control_steps)
+            env_sources = flat_sources[:, env_idx].reshape(total_control_steps)
             done_indices = [
                 int(idx.item())
                 for idx in torch.nonzero(env_dones, as_tuple=False).reshape(-1)
@@ -511,32 +543,46 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         dtype=env_interventions.dtype,
                         device=env_interventions.device,
                     )
+                    source_chunk = torch.full(
+                        (chunk_len,),
+                        int(TransitionSource.BASE),
+                        dtype=torch.uint8,
+                        device=env_sources.device,
+                    )
                     action_chunk[:valid_len] = env_actions[start:valid_end]
                     reward_chunk[:valid_len] = env_rewards[start:valid_end]
                     intervention_chunk[:valid_len] = env_interventions[start:valid_end]
+                    source_chunk[:valid_len] = env_sources[start:valid_end]
 
                     action_np = self._to_numpy_float(action_chunk).reshape(-1)
                     rewards_np = self._to_numpy_float(reward_chunk)
                     intervention_np = self._to_numpy_float(intervention_chunk)
-                    if intervention_np.any():
-                        action_for_ref = self._to_numpy_float(action_chunk).reshape(
-                            chunk_len,
-                            action_dim,
+                    source_chunk_np = self._to_numpy_uint8(source_chunk)
+                    collection_phase_id = None
+                    if collection_phase_id_all is not None:
+                        phase_idx = min(start // chunk_len, collection_phase_id_all.shape[0] - 1)
+                        collection_phase_id = int(
+                            collection_phase_id_all[phase_idx, env_idx]
+                            .reshape(-1)[0]
+                            .detach()
+                            .cpu()
+                            .item()
                         )
-                        a_tilde_chunk = a_tilde.reshape(chunk_len, action_dim).copy()
-                        mask = intervention_np.astype(bool)
-                        a_tilde_chunk[mask] = action_for_ref[mask]
-                        a_tilde = a_tilde_chunk.reshape(-1)
 
                     self.replay_buffer.add(
                         x=x,
-                        a=action_np,
-                        a_tilde=a_tilde,
+                        action_chunk=action_np,
+                        ref_chunk=a_tilde,
                         rewards=rewards_np,
                         next_x=next_x,
-                        next_a_tilde=next_a_tilde,
+                        next_ref_chunk=next_a_tilde,
                         done=float(terminal),
                         intervention=intervention_np,
+                        source=resolve_chunk_source(source_chunk_np),
+                        source_chunk=source_chunk_np,
+                        collection_phase=collection_phase_id,
+                        intervention_flag=bool(intervention_np.any()),
+                        step_id=start,
                     )
                     added += 1
 
@@ -593,6 +639,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
         intervention_flags_all = traj.forward_inputs.get("intervention_flags")
         if intervention_flags_all is None:
             intervention_flags_all = traj.intervene_flags
+        source_chunk_all = traj.forward_inputs.get("source_chunk")
+        collection_phase_id_all = traj.forward_inputs.get("collection_phase_id")
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
 
         for env_idx in range(bsz):
@@ -609,6 +657,27 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                         .numpy()
                         .astype(np.float32, copy=False)
                         .reshape(-1)
+                    )
+                source_chunk: np.ndarray | None = None
+                source: int | None = None
+                if source_chunk_all is not None:
+                    source_chunk = (
+                        source_chunk_all[t, env_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.uint8, copy=False)
+                        .reshape(-1)
+                    )
+                    source = resolve_chunk_source(source_chunk)
+                collection_phase_id = None
+                if collection_phase_id_all is not None:
+                    collection_phase_id = int(
+                        collection_phase_id_all[t, env_idx]
+                        .reshape(-1)[0]
+                        .detach()
+                        .cpu()
+                        .item()
                     )
 
                 x = x_all[t, env_idx].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -677,13 +746,18 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
 
                 self.replay_buffer.add(
                     x=x,
-                    a=action,
-                    a_tilde=a_tilde,
+                    action_chunk=action,
+                    ref_chunk=a_tilde,
                     rewards=rewards,
                     next_x=next_x,
-                    next_a_tilde=next_a_tilde,
+                    next_ref_chunk=next_a_tilde,
                     done=done,
                     intervention=intervention_mask,
+                    source=source,
+                    source_chunk=source_chunk,
+                    collection_phase=collection_phase_id,
+                    intervention_flag=bool(np.asarray(intervention_mask).any()),
+                    step_id=t,
                 )
                 added += 1
                 if env_done > 0.0:
@@ -1020,6 +1094,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
             actor_q_values = []
             actor_action_ref_abs = []
             actor_bc_losses = []
+            actor_bc_ref_losses = []
+            actor_bc_human_losses = []
+            actor_human_mask_ratios = []
             self.optimizer.zero_grad()
             self.model.set_online_critic_requires_grad(False)
             for idx, batch in enumerate(micro_batches):
@@ -1039,11 +1116,17 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                             apply_action_noise=True,
                         )
                         a_tilde_flat = batch["a_tilde"].to(torch.float32)
+                        action_chunk_flat = batch["action_chunk"].to(torch.float32)
                         action_ref_delta = actions - a_tilde_flat
                         chunk_len = int(self.cfg.actor.model.num_action_chunks)
                         action_dim = int(self.cfg.actor.model.action_dim)
                         actions_chunk = actions.reshape(-1, chunk_len, action_dim)
                         a_tilde_chunk = a_tilde_flat.reshape(-1, chunk_len, action_dim)
+                        executed_action_chunk = action_chunk_flat.reshape(
+                            -1,
+                            chunk_len,
+                            action_dim,
+                        )
                         q_value = self.model.critic_min(
                             batch["x"].to(torch.float32),
                             actions,
@@ -1052,6 +1135,8 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                             q_value=q_value,
                             a=actions_chunk,
                             a_tilde=a_tilde_chunk,
+                            action_chunk=executed_action_chunk,
+                            source_chunk=batch["source_chunk"].to(torch.uint8),
                             bc_weight=bc_weight,
                             q_weight=q_weight,
                             delta_weight=delta_weight,
@@ -1065,6 +1150,15 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                 )
                 actor_bc_losses.append(
                     float(actor_loss_metrics["bc_loss"].float().item())
+                )
+                actor_bc_ref_losses.append(
+                    float(actor_loss_metrics["bc_ref_loss"].float().item())
+                )
+                actor_bc_human_losses.append(
+                    float(actor_loss_metrics["bc_human_loss"].float().item())
+                )
+                actor_human_mask_ratios.append(
+                    float(actor_loss_metrics["human_mask_ratio"].float().item())
                 )
             self.model.set_online_critic_requires_grad(True)
 
@@ -1085,6 +1179,9 @@ class RLTStage2FSDPPolicyWorker(FSDPModelManager, Worker):
                     "actor/bc_weight": bc_weight,
                     "actor/q_weight": q_weight,
                     "actor/bc_loss": float(np.mean(actor_bc_losses)),
+                    "actor/bc_ref_loss": float(np.mean(actor_bc_ref_losses)),
+                    "actor/bc_human_loss": float(np.mean(actor_bc_human_losses)),
+                    "actor/human_mask_ratio": float(np.mean(actor_human_mask_ratios)),
                 }
             )
         else:
