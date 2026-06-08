@@ -9,6 +9,12 @@
 本文档给出在 RLinf 框架内启动与管理 **Vision-Language-Action Models (VLAs)** 训练任务的完整指南，
 在ManiSkill3环境中微调VLA模型以完成机器人操作。
 
+.. note::
+
+   如果你需要的是 **joint-control RLT** 两阶段流程，包括 ManiSkill 数据采集、
+   Stage1 RL token 训练和 Stage2 在线 TD3，请参考
+   :doc:`ManiSkill Joint-Control RLT <maniskill_rlt_joint>`。
+
 主要目标是让模型具备以下能力：
 
 1. **视觉理解**：处理来自机器人相机的 RGB 图像。  

@@ -3,7 +3,7 @@
 This module keeps the original Stage 2 structure lightweight:
 - a frozen VLA backbone provides reference actions and embeddings
 - a frozen RL token encoder compresses embeddings into z_rl
-- a residual actor predicts corrections over VLA reference chunks
+- a direct Gaussian actor predicts action chunks conditioned on VLA references
 - a twin-Q critic scores chunk actions for TD3-style updates
 """
 
@@ -17,7 +17,7 @@ from torch import Tensor, nn
 
 
 class MLP(nn.Module):
-    """Simple MLP used by the residual actor and Q networks."""
+    """Simple MLP used by the actor and Q networks."""
 
     def __init__(
         self,
@@ -39,14 +39,15 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class ResidualActor(nn.Module):
-    """Residual actor over VLA reference chunks.
+class DirectGaussianActor(nn.Module):
+    """Direct Gaussian actor over VLA-conditioned action chunks.
 
     The actor conditions on:
     - RL state x = [z_rl, s^p]
     - VLA reference action chunk a_tilde
 
-    The final action is a_tilde + residual, optionally with exploration noise.
+    It directly predicts the action chunk mean. During sampling, a small fixed
+    standard deviation is used, matching the RLT Gaussian actor formulation.
     """
 
     def __init__(
@@ -70,13 +71,8 @@ class ResidualActor(nn.Module):
             num_hidden_layers=num_hidden_layers,
         )
 
-        # Start from the frozen VLA reference exactly.
-        last_linear = [m for m in self.mlp.net if isinstance(m, nn.Linear)][-1]
-        nn.init.zeros_(last_linear.weight)
-        nn.init.zeros_(last_linear.bias)
-
     def _apply_ref_dropout(self, a_tilde: Tensor) -> Tensor:
-        if not self.training or self.ref_dropout <= 0.0:
+        if self.ref_dropout <= 0.0:
             return a_tilde
 
         keep_mask = (
@@ -94,15 +90,14 @@ class ResidualActor(nn.Module):
         apply_action_noise: bool | None = None,
     ) -> Tensor:
         if apply_ref_dropout is None:
-            apply_ref_dropout = not deterministic
+            apply_ref_dropout = False
         if apply_action_noise is None:
             apply_action_noise = not deterministic
 
         a_tilde_input = self._apply_ref_dropout(a_tilde) if apply_ref_dropout else a_tilde
-        residual = self.mlp(torch.cat([x, a_tilde_input], dim=-1))
-        action = a_tilde + residual
+        action = self.mlp(torch.cat([x, a_tilde_input], dim=-1))
 
-        if self.training and apply_action_noise and self.sigma > 0.0:
+        if apply_action_noise and self.sigma > 0.0:
             action = action + torch.randn_like(action) * self.sigma
         return action.clamp(-1.0, 1.0)
 
@@ -183,28 +178,24 @@ def compute_td_target(
     dones: Tensor,
     next_x: Tensor,
     next_a_tilde: Tensor,
-    actor: ResidualActor,
+    target_actor: DirectGaussianActor,
     critic: TwinQCritic,
     gamma: float,
     chunk_length: int,
-    target_noise_sigma: float = 0.2,
-    target_noise_clip: float = 0.5,
 ) -> Tensor:
-    """Compute TD3-style chunk target."""
+    """Compute chunk TD target using the target actor and target critic."""
     discount_powers = gamma ** torch.arange(
         chunk_length, device=rewards.device, dtype=rewards.dtype
     )
     chunk_return = (rewards * discount_powers).sum(dim=-1, keepdim=True)
 
-    was_training = actor.training
-    actor.eval()
-    next_a = actor(next_x, next_a_tilde, deterministic=True)
-    if was_training:
-        actor.train()
-
-    noise = torch.randn_like(next_a) * target_noise_sigma
-    noise = noise.clamp(-target_noise_clip, target_noise_clip)
-    next_a = (next_a + noise).clamp(-1.0, 1.0)
+    next_a = target_actor(
+        next_x,
+        next_a_tilde,
+        deterministic=False,
+        apply_ref_dropout=False,
+        apply_action_noise=True,
+    )
 
     next_q = critic.target_q_min(next_x, next_a)
     bootstrap = (gamma**chunk_length) * (1.0 - dones) * next_q

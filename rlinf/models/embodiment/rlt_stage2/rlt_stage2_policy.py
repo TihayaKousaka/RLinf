@@ -3,7 +3,7 @@
 This policy keeps the original Stage 2 structure:
 - frozen OpenPI VLA
 - frozen RL token encoder
-- trainable residual actor
+- trainable direct Gaussian actor
 - trainable twin-Q critic
 
 The policy exposes RLinf-compatible interfaces so the existing rollout/env
@@ -12,6 +12,7 @@ pipeline can be reused. Training itself is handled by a dedicated actor worker.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Literal
 
 import torch
@@ -19,7 +20,7 @@ from omegaconf import DictConfig
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 
-from .components import ResidualActor, TwinQCritic, compute_td_target
+from .components import DirectGaussianActor, TwinQCritic, compute_td_target
 from .rl_token import RLTokenModel
 from .vla_wrapper import Stage2VLAWrapper
 
@@ -83,7 +84,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         embedding_dim = int(stage2_cfg.get("embedding_dim", 2048))
         self.state_dim = embedding_dim + self.proprio_dim
 
-        self.actor = ResidualActor(
+        self.actor = DirectGaussianActor(
             state_dim=self.state_dim,
             action_chunk_dim=self.action_chunk_dim,
             hidden_dim=int(stage2_cfg.get("mlp_hidden_dim", 256)),
@@ -91,6 +92,9 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             sigma=float(stage2_cfg.get("actor_noise_sigma", 0.1)),
             ref_dropout=float(stage2_cfg.get("ref_action_dropout", 0.0)),
         ).to(self.device)
+        self.target_actor = copy.deepcopy(self.actor)
+        for param in self.target_actor.parameters():
+            param.requires_grad_(False)
 
         self.critic = TwinQCritic(
             state_dim=self.state_dim,
@@ -133,7 +137,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         if not filtered:
             raise ValueError(
                 "RLT Stage2 rollout sync state_dict is empty. Expected actor.* "
-                "parameters for residual actor weight sync."
+                "parameters for direct actor weight sync."
             )
         return filtered
 
@@ -206,10 +210,7 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
         self._validate_action_chunk(a_tilde, name="a_tilde")
         a_tilde_flat = a_tilde.reshape(a_tilde.shape[0], -1)
         self._validate_flat_action(a_tilde_flat, name="a_tilde_flat")
-        state = observation.state[:, : self.proprio_dim].to(
-            device=self.device,
-            dtype=torch.float32,
-        )
+        state = self.vla.extract_proprio(observation, self.proprio_dim)
         x = torch.cat([z_rl.to(torch.float32), state], dim=-1)
         return x, a_tilde_flat, processed_obs
 
@@ -269,16 +270,20 @@ class RLTStage2Policy(torch.nn.Module, BasePolicy):
             dones=dones,
             next_x=next_x,
             next_a_tilde=next_a_tilde,
-            actor=self.actor,
+            target_actor=self.target_actor,
             critic=self.critic,
             gamma=float(stage2_cfg.get("gamma", self.cfg.get("gamma", 0.99))),
             chunk_length=self.chunk_length,
-            target_noise_sigma=float(stage2_cfg.get("target_noise_sigma", 0.2)),
-            target_noise_clip=float(stage2_cfg.get("target_noise_clip", 0.5)),
         )
 
     @torch.no_grad()
     def update_target_networks(self, tau: float) -> None:
+        for online_param, target_param in zip(
+            self.actor.parameters(),
+            self.target_actor.parameters(),
+            strict=True,
+        ):
+            target_param.data.lerp_(online_param.data, tau)
         self.critic.update_targets(tau)
 
     def set_online_critic_requires_grad(self, requires_grad: bool) -> None:

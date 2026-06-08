@@ -18,6 +18,7 @@ class TransitionBatch:
     next_x: torch.Tensor
     next_a_tilde: torch.Tensor
     dones: torch.Tensor
+    intervention: torch.Tensor
 
     def to_dict(self) -> dict[str, torch.Tensor]:
         return {
@@ -28,6 +29,7 @@ class TransitionBatch:
             "next_x": self.next_x,
             "next_a_tilde": self.next_a_tilde,
             "dones": self.dones,
+            "intervention": self.intervention,
         }
 
 
@@ -58,7 +60,7 @@ class RLTStage2ReplayBuffer:
         self._next_x = np.zeros((capacity, state_dim), dtype=np.float32)
         self._next_a_tilde = np.zeros((capacity, action_chunk_dim), dtype=np.float32)
         self._dones = np.zeros((capacity, 1), dtype=np.float32)
-        self._intervention = np.zeros((capacity, 1), dtype=np.float32)
+        self._intervention = np.zeros((capacity, action_chunk_dim), dtype=np.float32)
 
     def __len__(self) -> int:
         return self._size
@@ -76,7 +78,7 @@ class RLTStage2ReplayBuffer:
         next_x: np.ndarray,
         next_a_tilde: np.ndarray,
         done: float,
-        intervention: float = 0.0,
+        intervention: float | np.ndarray = 0.0,
     ) -> None:
         self._x[self._ptr] = x
         self._a[self._ptr] = a
@@ -85,7 +87,27 @@ class RLTStage2ReplayBuffer:
         self._next_x[self._ptr] = next_x
         self._next_a_tilde[self._ptr] = next_a_tilde
         self._dones[self._ptr] = done
-        self._intervention[self._ptr] = intervention
+        intervention_array = np.asarray(intervention, dtype=np.float32)
+        if intervention_array.size == 1:
+            intervention_array = np.full(
+                (self.action_chunk_dim,),
+                float(intervention_array.reshape(-1)[0]),
+                dtype=np.float32,
+            )
+        elif intervention_array.size == self.chunk_length:
+            action_dim = self.action_chunk_dim // self.chunk_length
+            intervention_array = np.repeat(
+                intervention_array.reshape(self.chunk_length, 1),
+                action_dim,
+                axis=1,
+            )
+        if intervention_array.size != self.action_chunk_dim:
+            raise ValueError(
+                "RLT intervention mask must be scalar, chunk_length, or action_chunk_dim, "
+                f"got {intervention_array.shape=} for {self.chunk_length=} "
+                f"and {self.action_chunk_dim=}."
+            )
+        self._intervention[self._ptr] = intervention_array.reshape(-1)
 
         self._ptr = (self._ptr + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
@@ -100,6 +122,7 @@ class RLTStage2ReplayBuffer:
             next_x=torch.as_tensor(self._next_x[indices], device=device),
             next_a_tilde=torch.as_tensor(self._next_a_tilde[indices], device=device),
             dones=torch.as_tensor(self._dones[indices], device=device),
+            intervention=torch.as_tensor(self._intervention[indices], device=device),
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -134,7 +157,10 @@ class RLTStage2ReplayBuffer:
         self._next_a_tilde[:n] = state["next_a_tilde"]
         self._dones[:n] = state["dones"]
         if "intervention" in state:
-            self._intervention[:n] = state["intervention"]
+            intervention = np.asarray(state["intervention"], dtype=np.float32)
+            if intervention.ndim == 2 and intervention.shape[1] == 1:
+                intervention = np.repeat(intervention, self.action_chunk_dim, axis=1)
+            self._intervention[:n] = intervention.reshape(n, self.action_chunk_dim)
         rng_state = state.get("rng_state")
         if rng_state is not None:
             self._rng.bit_generator.state = rng_state

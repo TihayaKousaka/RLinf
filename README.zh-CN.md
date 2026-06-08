@@ -29,6 +29,7 @@ RLinf 是一个灵活且可扩展的开源框架，专为具身智能和智能�
 </div>
 
 ## 最新动态
+- [2026/06] 🔥 RLinf 新增 ManiSkill joint-control RLT 专项文档，覆盖数据采集、Stage1 RL token 训练与 Stage2 在线 TD3。文档: [ManiSkill Joint-Control RLT](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/maniskill_rlt_joint.html)。
 - [2026/05] 🔥 RLinf 支持 AgentLightning 单智能体强化学习训练。文档: [AgentLightning Calc-X](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/agentic/agentlightning_calc_x.html)。
 - [2026/05] 🔥 RLinf 支持 DreamZero 模型的监督微调. Doc: [DreamZero](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/sft_dreamzero.html)
 - [2026/05] 🔥 RLinf 支持 GimArm. 文档: [GimArm](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/gim_arm.html)

@@ -20,6 +20,17 @@
      </div>
 
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <img src="https://github.com/RLinf/misc/raw/main/pic/mani_openvla.png"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="maniskill_rlt_joint.html" style="text-decoration: underline; color: blue;">
+           <b>ManiSkill Joint-Control RLT</b>
+         </a><br>
+         ManiSkill joint-control 数据采集、Stage1 RL token 和 Stage2 在线 TD3 全流程
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
        <img src="https://github.com/RLinf/misc/raw/main/pic/libero_numbers.jpeg"
             style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" />
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
@@ -486,6 +497,7 @@
    :maxdepth: 2
 
    maniskill
+   maniskill_rlt_joint
    libero
    libero_amd
    libero_ascend

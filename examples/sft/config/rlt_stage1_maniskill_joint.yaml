@@ -45,7 +45,7 @@ actor:
 
   model:
     precision: null
-    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260530-22:57:46/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_5500/actor"
+    model_path: "/mnt/public2/xiekaizhi/rlt-openpi-sim/RLinf/logs/20260530-22:57:46/rlt_maniskill_joint_pi05_sft/checkpoints/global_step_2000/actor"
     num_action_chunks: 10
     action_dim: 8
     rlt_stage1:
